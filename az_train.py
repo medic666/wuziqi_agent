@@ -624,9 +624,9 @@ class AlphaZeroTrainer:
 
     def _evaluate_baseline(self, iteration: int):
         try:
-            from agent import Agent
+            from agent_ad import Agent
             logger.info(f"[基准评估] 最佳模型 vs 规则引擎...")
-            baseline_agent = Agent(depth=2, max_candidates=8, name="RuleBaseline")
+            baseline_agent = Agent(depth=4, max_candidates=10, name="RuleBaseline")
             mcts_az = MCTS(
                 eval_fn=create_local_eval_fn(self.best_model, self.device),
                 c_puct=self.config.c_puct, num_simulations=200,
