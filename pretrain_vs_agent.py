@@ -54,10 +54,10 @@ class PretrainConfig:
 
     # MCTS
     num_sims: int = 400
-    c_puct: float = 2.5
+    c_puct: float = 1.5
     dirichlet_alpha: float = 0.2
-    dirichlet_epsilon: float = 0.25
-    temp_threshold: int = 20
+    dirichlet_epsilon: float = 0 #不要探索因为agent对手本身很随机
+    temp_threshold: int = 6
     candidate_radius: int = 3
     advantage_clip: float = 1.0
 
