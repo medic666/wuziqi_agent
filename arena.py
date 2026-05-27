@@ -469,15 +469,15 @@ if __name__ == '__main__':
 
     # ── 神经网络 Agent（参考 az_train._arena_phase 的调用方式） ──
     az_agent1 = AZAgent(
-        model_path="checkpoints/pretrain_vs_agent/best_model_old.pt",
-        num_sims=200,
+        model_path="checkpoints/pretrain_vs_agent/best_model.pt",
+        num_sims=400,
         temperature=0.0,       # 确定性走子（竞技场不探索）
         dirichlet_epsilon=0.0, # 不加 Dirichlet 噪声
         name="AlphaOld",
     )
     az_agent2 = AZAgent(
         model_path="checkpoints/pretrain_vs_agent/self_play_model.pt",
-        num_sims=200,
+        num_sims=400,
         temperature=0.0,       # 确定性走子（竞技场不探索）
         dirichlet_epsilon=0.0, # 不加 Dirichlet 噪声
         name="AlphaCurr",

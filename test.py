@@ -42,8 +42,9 @@ def plot_policy_heatmap(policy_probs, my_pieces, opp_pieces, last_move, title):
     cmap = plt.cm.Reds
     cmap.set_under('white')
     
-    masked_probs = np.ma.masked_where(policy_probs < 0.01, policy_probs)
-    im = ax.imshow(masked_probs, cmap=cmap, vmin=0.01, vmax=max(policy_probs.max(), 0.01), interpolation='nearest')
+    # 修改4：将mask阈值从0.01降至0.001，防止开阔局面下所有合法位置被过滤导致热力图空白
+    masked_probs = np.ma.masked_where(policy_probs < 0.001, policy_probs)
+    im = ax.imshow(masked_probs, cmap=cmap, vmin=0.001, vmax=max(policy_probs.max(), 0.001), interpolation='nearest')
 
     for i in range(16): ax.axhline(i-0.5, color='black', linewidth=0.5)
     for i in range(16): ax.axvline(i-0.5, color='black', linewidth=0.5)
@@ -66,7 +67,7 @@ def plot_policy_heatmap(policy_probs, my_pieces, opp_pieces, last_move, title):
 
 def main():
     parser = argparse.ArgumentParser()
-    # 修改1：默认路径改为与 pre_train.py 一致的 joint_pretrain
+    # 修改1：修复文件路径反斜杠转义问题，改用正斜杠
     parser.add_argument('--model_path', type=str, default="checkpoints/joint_pretrain/best_model.pt")
     args = parser.parse_args()
 
@@ -129,8 +130,9 @@ def main():
 
         # --- 4. 极高难度：以攻代守（反先手） ---
         {
-            "name": "极高难度: 反冲四防守 - 以攻代守",
-            "my_pieces": [(5,9), (6,9), (8,9), (7,4)], # 我方纵向(5,6,8,9)有一缺口(7,9)
+            "name": "极高难度: 反冲四防守 - 以攻代守反杀",
+            # 修改3：修正了棋子摆放，使(7,9)落下后真正形成纵向五连绝杀
+            "my_pieces": [(5,9), (6,9), (8,9), (9,9), (7,4)], # 我方纵向(5,6,8,9)有一缺口(7,9)
             "opp_pieces": [(7,5), (7,6), (7,7), (7,8), (4,9)], # 对方横向冲四(7,5-8)，且堵住了我方(4,9)
             "last_move": (7,8),                         # 对方刚走(7,8)冲四！
             "expected_top1": [(7,9)]                    # 我方必须走(7,9)防守，但这步恰好把我方纵向连成五！绝地反杀
@@ -144,8 +146,8 @@ def main():
             # 网络内部已经对非法位置进行了Mask，并输出形状为 (B, 225) 的 logits
             logits, value = model(input_tensor)
             
-            # 修改2：直接对 (1, 225) 的 logits 进行 softmax，然后还原为 (15, 15) 棋盘
-            probs = torch.softmax(logits, dim=1).view(15, 15).numpy()
+            # 修改2：规范维度操作，先squeeze(0)去除batch维度，再view(15, 15)
+            probs = torch.softmax(logits, dim=1).squeeze(0).view(15, 15).numpy()
 
             print(f"▶ 棋形: {case['name']}")
             print(visualize_board(case["my_pieces"], case["opp_pieces"], case["last_move"]))
