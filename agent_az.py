@@ -6,104 +6,103 @@ from gamerules import GameState
 from network import ActorCriticNet
 from mcts import MCTS, create_local_eval_fn
 
-class AZAgent(BaseAgent):
+# ═══════════════════════════════════════════════════════════════
+#  AZAgent: AlphaZero 神经网络 Agent
+# ═══════════════════════════════════════════════════════════════
+
+class AZAgent:
+    """AlphaZero 神经网络 Agent，使用 MCTS + 神经网络进行决策
+
+    支持树复用：在连续走子间复用 MCTS 搜索树，大幅减少重复计算。
+    参考:
+      - az_train._arena_phase: create_local_eval_fn 创建本地评估函数
+      - pretrain_vs_agent.worker_loop_vs_agent: MCTS 树两步复用模式
+    """
+
     def __init__(
         self,
-        model_path: Optional[str] = None,
-        model: Optional[ActorCriticNet] = None,
+        model_path: str,
         num_sims: int = 400,
-        c_puct: float = 1.5,
+        c_puct: float = 2.5,
         temperature: float = 0.0,
-        dirichlet_alpha: float = 0.3,
+        dirichlet_alpha: float = 0.2,
         dirichlet_epsilon: float = 0.0,
-        candidate_radius: int = 2,
+        candidate_radius: int = 3,
         advantage_clip: float = 1.0,
-        device_str: str = "auto",
-        name: str = "AZAgent",
+        name: str = "AlphaZero",
+        device: str = "auto",
     ):
         self.name = name
-        self.num_sims = num_sims
-        self.c_puct = c_puct
         self.temperature = temperature
-        self.dirichlet_alpha = dirichlet_alpha
-        self.dirichlet_epsilon = dirichlet_epsilon
-        self.candidate_radius = candidate_radius
-        self.advantage_clip = advantage_clip
 
-        if device_str == "auto":
+        # ── 确定设备 ──
+        if device == "auto":
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
-            self.device = torch.device(device_str)
+            self.device = torch.device(device)
 
-        if model is not None:
-            self.model = model.to(self.device)
-        elif model_path is not None:
-            self.model = self._load_model(model_path)
-        else:
-            raise ValueError("必须提供 model_path 或 model")
+        # ── 加载模型（参考 inference_server 的加载逻辑，自动推断架构） ──
+        ckpt = torch.load(model_path, map_location=self.device, weights_only=False)
+        state_dict = ckpt.get('model_state_dict', ckpt)
 
+        channels = state_dict['stem_conv.weight'].shape[0]
+        res_block_indices = [
+            int(k.split('.')[1]) for k in state_dict if k.startswith('res_blocks.')
+        ]
+        num_blocks = max(res_block_indices) + 1 if res_block_indices else 4
+
+        self.model = ActorCriticNet(
+            num_res_blocks=num_blocks, channels=channels
+        ).to(self.device)
+        self.model.load_state_dict(state_dict)
         self.model.eval()
+
+        if self.device.type == 'cuda':
+            torch.backends.cudnn.benchmark = True
+
+        # ── 创建 MCTS（参考 az_train._arena_phase 的做法） ──
+        eval_fn = create_local_eval_fn(self.model, self.device)
         self.mcts = MCTS(
-            eval_fn=create_local_eval_fn(self.model, self.device),
-            c_puct=self.c_puct,
-            num_simulations=self.num_sims,
-            dirichlet_alpha=self.dirichlet_alpha,
-            dirichlet_epsilon=self.dirichlet_epsilon,
-            candidate_radius=self.candidate_radius,
-            advantage_clip=self.advantage_clip,
+            eval_fn=eval_fn,
+            c_puct=c_puct,
+            num_simulations=num_sims,
+            dirichlet_alpha=dirichlet_alpha,
+            dirichlet_epsilon=dirichlet_epsilon,
+            candidate_radius=candidate_radius,
+            advantage_clip=advantage_clip,
         )
 
-    def _load_model(self, path: str) -> ActorCriticNet:
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        state_dict = checkpoint.get('model_state_dict', checkpoint)
-        stem_key = 'stem_conv.weight'
-        if stem_key in state_dict:
-            channels = state_dict[stem_key].shape[0]
-        else:
-            channels = 128
-        num_blocks = 0
-        for key in state_dict:
-            if key.startswith('res_blocks.'):
-                block_idx = int(key.split('.')[1])
-                num_blocks = max(num_blocks, block_idx + 1)
-        model = ActorCriticNet(num_res_blocks=max(num_blocks, 4), channels=channels)
-        model.load_state_dict(state_dict)
-        model.to(self.device)
-        return model
+        self._my_last_action = None
 
-    def get_move(self, state: GameState) -> Tuple[int, int]:
-        last_action = state.last_move
-        if not state.history:
-            self.mcts.root = None
-            last_action = None
-        if self.mcts.root is not None and last_action is not None:
-            if last_action not in self.mcts.root.children:
+    def new_game(self):
+        """新一局开始时调用，重置搜索树和记录"""
+        self.mcts.root = None
+        self._my_last_action = None
+
+    def get_move(self, state):
+        """选择落子，支持 MCTS 树复用
+
+        树复用逻辑（参考 pretrain_vs_agent.worker_loop_vs_agent）：
+          1. 先推进过自己上一步的子节点（手动推进）
+          2. 再通过 search(last_action=对手上一步) 推进过对手的子节点（MCTS 内部处理）
+          3. 在复用后的子树上继续搜索，避免每步从零开始
+        """
+        # 步骤1: 推进过自己上一步
+        #   搜索结束后，root 的 children 包含自己的候选动作
+        #   推进到实际选择的那步，其 children 就是对手的候选响应
+        if self._my_last_action is not None and self.mcts.root is not None:
+            if self._my_last_action in self.mcts.root.children:
+                child = self.mcts.root.children[self._my_last_action]
+                child.parent = None  # 切断反向传播链接，防止内存泄漏
+                self.mcts.root = child
+            else:
                 self.mcts.root = None
-                
-        _, action, _ = self.mcts.search(state, temperature=self.temperature, last_action=last_action)
+
+        # 步骤2: search 内部通过 last_action 推进过对手上一步，并在复用子树上搜索
+        #   state.last_move 就是对手的落子，传给 search 实现自动树复用
+        _, action, _ = self.mcts.search(
+            state, temperature=self.temperature, last_action=state.last_move
+        )
+
+        self._my_last_action = action
         return action
-
-    def get_move_with_policy(self, state: GameState, temperature: float = 1.0):
-        last_action = state.last_move
-        if not state.history:
-            self.mcts.root = None
-            last_action = None
-        if self.mcts.root is not None and last_action is not None:
-            if last_action not in self.mcts.root.children:
-                self.mcts.root = None
-                
-        policy, action, _ = self.mcts.search(state, temperature=temperature, last_action=last_action)
-        return action, policy
-
-    def update_model(self, model: ActorCriticNet):
-        self.model = model.to(self.device)
-        self.model.eval()
-        self.mcts = MCTS(
-            eval_fn=create_local_eval_fn(self.model, self.device),
-            c_puct=self.c_puct,
-            num_simulations=self.num_sims,
-            dirichlet_alpha=self.dirichlet_alpha,
-            dirichlet_epsilon=self.dirichlet_epsilon,
-            candidate_radius=self.candidate_radius,
-            advantage_clip=self.advantage_clip,
-        )
