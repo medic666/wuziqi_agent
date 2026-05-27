@@ -1,21 +1,13 @@
 # pretrain_vs_agent.py
 """
-五子棋神经网络预训练模块：与 AgentAD 对弈 (合并成熟版)v9.5
+五子棋神经网络预训练模块：与 AgentAD 对弈 (极简版) v11.0
 
-融合双方精华：
-  ✅ 评估图片 Worker 内保存 + 轻量级 IPC (对方)
-  ✅ 评估模型从内存临时保存，用完即删 (对方)
-  ✅ 评估 Worker 数动态计算 min(workers, games) (对方)
-  ✅ 标准交叉熵，去除 advantage 加权，修复 Loss 为负 (我方)
-  ✅ 独立 eval_vs_agent_parallel 函数，模块化清晰 (我方)
-  ✅ MCTS树复用逻辑修正：移除伪两步推进，保证状态绝对正确 (我方)
-  ✅ AgentAD 置换表持久化 + Zobrist指纹校验 + Worker0继承
-  ✅ Top-K精度 / MAE / 早停 / Cosine LR+Warmup
-  ✅ 两阶段断点续训 / 优势裁剪+HuberLoss
+核心逻辑：对弈即评估，胜率驱动早停
+  流程：对弈 → 记录胜率 → 早停判断 → 训练 → 循环
+  模型同步：对弈前 model->pt，新高时 model->best
 """
 
 import os
-import sys
 import time
 import math
 import argparse
@@ -24,7 +16,7 @@ import queue
 import hashlib
 import pickle
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional
 
 import torch.multiprocessing as mp
 import numpy as np
@@ -35,16 +27,12 @@ from tqdm import tqdm
 
 from gamerules import GameState, GomokuRules
 from network import ActorCriticNet
-from mcts import MCTS, state_to_tensor, create_local_eval_fn
+from mcts import MCTS, state_to_tensor
 from inference_server import InferenceServer
 from agent_ad import Agent as AgentAD
 from utils import transform_2d, transform_state, save_board_image
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%H:%M:%S',
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger(__name__)
 
 BOARD_SIZE = GomokuRules.BOARD_SIZE
@@ -61,11 +49,11 @@ class PretrainConfig:
     board_size: int = 15
 
     # 预训练轮次
-    num_iterations: int = 15
+    num_iterations: int = 50
     games_per_iteration: int = 200
 
     # MCTS
-    num_sims: int = 200
+    num_sims: int = 400
     c_puct: float = 2.5
     dirichlet_alpha: float = 0.2
     dirichlet_epsilon: float = 0.25
@@ -89,23 +77,22 @@ class PretrainConfig:
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
     value_loss_delta: float = 0.5
-    early_stop_patience: int = 5
+
+    # 早停 (仅早停，无回退)
+    early_stop_patience: int = 10
     early_stop_min_delta: float = 0.02
 
     # 多进程
     num_workers: int = 8
     max_batch_size: int = 128
 
-    # 存档 & 评估
+    # 存档
     checkpoint_dir: str = "checkpoints/pretrain_vs_agent"
     initial_model: Optional[str] = "checkpoints/joint_pretrain/best_model.pt"
-    eval_interval: int = 2
-    eval_games: int = 10
 
     # 图片保存配置
     save_images: bool = True
-    save_image_every_n_games: int = 50
-    save_eval_images: bool = True
+    save_image_every_n_games: int = 10
 
     # 置换表
     tt_save_interval: int = 10
@@ -260,14 +247,12 @@ def worker_loop_vs_agent(
             net_player = 1 if net_is_black else 2
             agent._chosen_opening, agent._opening_step = None, 0
             agent.reset_incremental_cache()
-            mcts.root = None  # 每局重置
+            mcts.root = None
 
             while move_count < BOARD_SQUARES:
                 is_net_turn = (state.current_player == net_player)
                 if is_net_turn:
                     temperature = 1.0 if move_count < temp_threshold else 1e-3
-                    # ✅ 修正：由于对手走子时MCTS没有搜索，树无法同步推进两步
-                    # 为保证状态绝对正确，网络走子时不传 last_action，从当前根重建
                     mcts_policy, action, advantages = mcts.search(state, temperature=temperature, last_action=None)
                     states_list.append(state_to_tensor(state))
                     policies_list.append(mcts_policy)
@@ -293,73 +278,6 @@ def worker_loop_vs_agent(
 
     try: _save_trans_table(agent, tt_path)
     except Exception: pass
-    output_queue.put(("DONE", worker_id))
-
-
-# ═══════════════════════ 评估 Worker (并行版，图片内置保存) ═══════════════════════
-
-def eval_worker_loop_vs_agent(
-    worker_id, request_queue, result_queue, task_queue, output_queue,
-    num_sims, c_puct, candidate_radius, advantage_clip,
-    agent_depth, agent_max_candidates, agent_use_quiescence, agent_vct_depth,
-    save_eval_images, eval_image_dir
-):
-    """评估专用 Worker：网络 vs AgentAD，仅返回轻量结果，图片内部保存"""
-    agent = AgentAD(depth=agent_depth, max_candidates=agent_max_candidates,
-                    use_quiescence=agent_use_quiescence, vct_depth=agent_vct_depth, name="AgentAD_Eval")
-
-    def server_eval_fn(state_np):
-        request_queue.put((worker_id, state_np))
-        try: policy, value = result_queue.get(timeout=120)
-        except queue.Empty: raise RuntimeError("评估推理服务器超时(120s)")
-        if policy is None: raise RuntimeError("评估推理服务器返回异常")
-        return policy, value
-
-    mcts = MCTS(eval_fn=server_eval_fn, c_puct=c_puct, num_simulations=num_sims,
-                dirichlet_epsilon=0.0,  # 评估不加噪声
-                candidate_radius=candidate_radius, advantage_clip=advantage_clip)
-    consecutive_failures = 0
-
-    while True:
-        try: task = task_queue.get(timeout=5)
-        except queue.Empty: break
-        if task is None: break
-        game_idx = task
-
-        try:
-            state = GameState(board=bytearray(BOARD_SQUARES), current_player=1, history=[], last_move=None)
-            az_is_black = (game_idx % 2 == 0)
-            net_player = 1 if az_is_black else 2
-            agent._chosen_opening, agent._opening_step = None, 0
-            agent.reset_incremental_cache()
-            mcts.root = None  # 每局重置
-            move_count = 0
-
-            while move_count < BOARD_SQUARES:
-                is_net_turn = (state.current_player == net_player)
-                if is_net_turn:
-                    _, action, _ = mcts.search(state, temperature=1e-3, last_action=None)
-                else:
-                    action = agent.get_move(state)
-
-                GomokuRules.apply_move_fast(state, action)
-                move_count += 1
-                winner = GomokuRules.check_winner(state)
-                if winner is not None: break
-
-            # ✅ 图片在 Worker 内直接保存，避免传输 history 的 IPC 开销
-            if save_eval_images:
-                save_board_image(eval_image_dir, game_idx + 1, list(state.history), winner)
-
-            # ✅ 只传轻量结果，不传 history
-            output_queue.put((game_idx, winner, az_is_black, move_count))
-            consecutive_failures = 0
-        except Exception as e:
-            consecutive_failures += 1
-            logger.error(f"EvalWorker {worker_id} 游戏 {game_idx} 出错: {e}")
-            output_queue.put((game_idx, -1, True, 0))  # -1 代表出错，算对手赢
-            if consecutive_failures >= 3: break
-
     output_queue.put(("DONE", worker_id))
 
 
@@ -413,7 +331,7 @@ def agent_play_phase_parallel(model_path, device_str, num_games, temp_threshold,
         elif winner == net_player: net_wins += 1
         else: agent_wins += 1
         games_completed += 1
-        
+
         if config.save_images and games_completed % config.save_image_every_n_games == 0:
             save_board_image(image_dir, games_completed, history, winner)
         pbar.update(1)
@@ -429,76 +347,6 @@ def agent_play_phase_parallel(model_path, device_str, num_games, temp_threshold,
     return all_samples, win_rate
 
 
-# ═══════════════════════ 并行调度：评估 (独立模块，合并优化) ═══════════════════════
-
-def eval_vs_agent_parallel(model, device_str, num_games, num_workers, max_batch_size, config):
-    """评估阶段：复用 InferenceServer + 多进程，Worker内保存图片"""
-    # ✅ 对方优点：从内存临时保存模型，确保评估的是刚训练完的最新权重
-    model_path = os.path.join(config.checkpoint_dir, 'eval_model.pt')
-    torch.save({'model_state_dict': model.state_dict()}, model_path)
-
-    # ✅ 对方优点：动态计算评估 Worker 数
-    num_eval_workers = min(num_workers, num_games)
-    logger.info(f"启动评估推理服务器 ({num_eval_workers} Workers)...")
-    server = InferenceServer(model_path, device_str, num_eval_workers, max_batch_size)
-    server.ready_event.wait(); logger.info("评估推理服务器已就绪")
-
-    task_queue = mp.Queue()
-    for i in range(num_games): task_queue.put(i)
-    for _ in range(num_eval_workers): task_queue.put(None)
-
-    eval_image_dir = os.path.join(config.checkpoint_dir, "eval_images")
-    if config.save_eval_images: os.makedirs(eval_image_dir, exist_ok=True)
-
-    eval_queues = [server.get_queues(i) for i in range(num_eval_workers)]
-    output_queue = mp.Queue()
-    processes = []
-    for i in range(num_eval_workers):
-        req_q, res_q = eval_queues[i]
-        p = mp.Process(target=eval_worker_loop_vs_agent, args=(
-            i, req_q, res_q, task_queue, output_queue, config.num_sims, config.c_puct,
-            config.candidate_radius, config.advantage_clip, config.agent_depth,
-            config.agent_max_candidates, config.agent_use_quiescence, config.agent_vct_depth,
-            config.save_eval_images, eval_image_dir
-        ), daemon=True); p.start(); processes.append(p)
-
-    results = {}; games_completed = 0; workers_done = 0
-    pbar = tqdm(total=num_games, desc="评估(vs AgentAD)")
-
-    while workers_done < num_eval_workers:
-        try: result = output_queue.get(timeout=180)
-        except queue.Empty: continue
-        if isinstance(result, tuple) and len(result) >= 2:
-            if result[0] == "DONE": workers_done += 1; continue
-            elif result[0] == "FATAL": workers_done = num_eval_workers; continue
-
-        game_idx, winner, az_is_black, moves = result
-        results[game_idx] = (winner, az_is_black, moves)
-        games_completed += 1; pbar.update(1)
-
-    pbar.close()
-    for p in processes: p.join(timeout=5); p.terminate() if p.is_alive() else None
-    server.shutdown()
-
-    # ✅ 对方优点：评估完删除临时模型文件
-    try:
-        if os.path.exists(model_path): os.remove(model_path)
-    except Exception: pass
-
-    az_wins, agent_wins, draws, total_moves = 0, 0, 0, 0
-    for game_idx in sorted(results.keys()):
-        winner, az_is_black, moves = results[game_idx]
-        total_moves += moves
-        if winner == 0: draws += 1
-        elif (winner == 1 and az_is_black) or (winner == 2 and not az_is_black): az_wins += 1
-        else: agent_wins += 1
-
-    win_rate = az_wins / num_games if num_games > 0 else 0
-    avg_moves = total_moves / num_games if num_games > 0 else 0
-    logger.info(f"  评估: 模型{az_wins}胜 / Agent{agent_wins}胜 / 平{draws} | 胜率{win_rate:.1%} | 平均{avg_moves:.0f}步")
-    return win_rate
-
-
 # ═══════════════════════ 预训练器 ═══════════════════════
 
 class AgentPreTrainer:
@@ -510,12 +358,11 @@ class AgentPreTrainer:
         self.value_loss_fn = nn.HuberLoss(delta=config.value_loss_delta)
         self._create_optimizer()
 
-        self.current_iteration = 0; self.current_phase = 0
-        self.best_win_rate = 0.0; self.es_counter = 0
-        self.iteration_stats = []; self._should_stop = False
+        self.current_iteration = 0
+        self.best_win_rate = 0.0
+        self.es_counter = 0
 
-        loaded = self._load_checkpoint()
-        if not loaded: self._load_initial_model()
+        self._load_checkpoint_or_initial()
         if self.device.type == 'cuda': torch.backends.cudnn.benchmark = True
         self._print_header()
 
@@ -533,14 +380,43 @@ class AgentPreTrainer:
         progress = (iteration - warmup) / max(1, total - warmup)
         return lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
-    def _load_initial_model(self):
+    def _load_checkpoint_or_initial(self):
+        ckpt_path = os.path.join(self.config.checkpoint_dir, 'latest_checkpoint.pt')
+        if os.path.exists(ckpt_path):
+            logger.info(f"发现断点存档: {ckpt_path}")
+            try:
+                ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+                self.model.load_state_dict(ckpt['model_state_dict'])
+                self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                for s in self.optimizer.state.values():
+                    for k, v in s.items():
+                        if isinstance(v, torch.Tensor): s[k] = v.to(self.device)
+                self.current_iteration = ckpt.get('iteration', 0) + 1  # 从下一轮继续
+                self.best_win_rate = ckpt.get('best_win_rate', 0.0)
+                self.es_counter = ckpt.get('es_counter', 0)
+
+                rb_path = os.path.join(self.config.checkpoint_dir, 'replay_buffer.npz')
+                if os.path.exists(rb_path):
+                    data = np.load(rb_path, allow_pickle=True)
+                    cursor = int(data['cursor'][0])
+                    adv = data['advantages'] if 'advantages' in data else None
+                    self.replay_buffer.restore_from_linearized(data['states'], data['policies'], data['values'], cursor, advantages=adv)
+                    logger.info(f"  回放缓冲区恢复: {len(data['states']):,} 样本")
+
+                logger.info(f"  ✓ 从迭代 {self.current_iteration} 继续训练 | 历史最佳胜率: {self.best_win_rate:.1%}")
+                return
+            except Exception as e:
+                logger.error(f"断点加载失败: {e}，将从头开始")
+
+        # 没有断点，尝试加载初始模型
         path = self.config.initial_model
         if path and os.path.exists(path):
             logger.info(f"加载初始模型: {path}")
             ckpt = torch.load(path, map_location=self.device, weights_only=False)
             self.model.load_state_dict(ckpt.get('model_state_dict', ckpt))
             logger.info("✓ 初始模型加载成功")
-        else: logger.info("未指定初始模型，从随机权重开始")
+        else:
+            logger.info("未指定初始模型，从随机权重开始")
 
     # -------------------- 训练 --------------------
 
@@ -563,7 +439,6 @@ class AgentPreTrainer:
         logits, pred_vals = self.model(states_t)
         logits_flat = logits.view(B, -1)
 
-        # ✅ 我方优点：标准交叉熵（MCTS分布已编码优势，不加权，修复Loss为负）
         log_policy = F.log_softmax(logits_flat, dim=1)
         log_policy_safe = torch.where(policies_t > 0, log_policy, torch.zeros_like(log_policy))
         policy_loss = -(policies_t * log_policy_safe).sum(dim=1).mean()
@@ -614,72 +489,32 @@ class AgentPreTrainer:
                     f"Top1={avg['top1']:.1%} | Top3={avg['top3']:.1%} | MAE={avg['mae']:.3f} | LR={avg['lr']:.2e}")
         return avg
 
-    # -------------------- 评估 --------------------
-
-    def _evaluate_vs_agent(self):
-        logger.info(f"[评估] 当前模型 vs AgentAD (depth={self.config.agent_depth}, "
-                    f"workers={min(self.config.num_workers, self.config.eval_games)})...")
-        
-        # ✅ 我方优点：模块化调用独立函数
-        return eval_vs_agent_parallel(
-            model=self.model, device_str=str(self.device),
-            num_games=self.config.eval_games, num_workers=self.config.num_workers,
-            max_batch_size=self.config.max_batch_size, config=self.config,
-        )
-
     # -------------------- 存档 --------------------
 
-    def _save_checkpoint(self, is_best=False, save_replay=False, phase=0):
+    def _save_checkpoint(self, is_best=False):
         os.makedirs(self.config.checkpoint_dir, exist_ok=True)
         state = {
-            'iteration': self.current_iteration, 'current_phase': phase,
-            'model_state_dict': self.model.state_dict(), 'optimizer_state_dict': self.optimizer.state_dict(),
-            'best_win_rate': self.best_win_rate, 'es_counter': self.es_counter,
-            'config': self.config.to_dict(), 'iteration_stats': self.iteration_stats,
+            'iteration': self.current_iteration,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'best_win_rate': self.best_win_rate,
+            'es_counter': self.es_counter,
+            'config': self.config.to_dict(),
             'replay_buffer_cursor': self.replay_buffer.cursor,
         }
         torch.save(state, os.path.join(self.config.checkpoint_dir, 'latest_checkpoint.pt'))
+        
         if is_best:
             torch.save({'model_state_dict': self.model.state_dict()},
                        os.path.join(self.config.checkpoint_dir, 'best_model.pt'))
-            logger.info(f"  ★ 新最佳模型 → best_model.pt (胜率 {self.best_win_rate:.1%})")
-        if save_replay:
+
+        # 每3轮保存一次回放缓冲区（文件较大，减少IO）
+        if (self.current_iteration + 1) % 3 == 0:
             s, p, v, a = self.replay_buffer.get_linearized_data()
             if s is not None:
                 np.savez_compressed(os.path.join(self.config.checkpoint_dir, 'replay_buffer.npz'),
                                     states=s, policies=p, values=v,
                                     cursor=np.array([self.replay_buffer.cursor]), advantages=a)
-
-    def _load_checkpoint(self) -> bool:
-        path = os.path.join(self.config.checkpoint_dir, 'latest_checkpoint.pt')
-        if not os.path.exists(path): return False
-        try:
-            ckpt = torch.load(path, map_location=self.device, weights_only=False)
-            self.model.load_state_dict(ckpt['model_state_dict'])
-            self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-            for s in self.optimizer.state.values():
-                for k, v in s.items():
-                    if isinstance(v, torch.Tensor): s[k] = v.to(self.device)
-            self.current_iteration = ckpt.get('iteration', 0)
-            self.current_phase = ckpt.get('current_phase', 0)
-            self.best_win_rate = ckpt.get('best_win_rate', 0.0)
-            self.es_counter = ckpt.get('es_counter', 0)
-            self.iteration_stats = ckpt.get('iteration_stats', [])
-
-            rb_path = os.path.join(self.config.checkpoint_dir, 'replay_buffer.npz')
-            if os.path.exists(rb_path):
-                data = np.load(rb_path, allow_pickle=True)
-                cursor = int(data['cursor'][0])
-                adv = data['advantages'] if 'advantages' in data else None
-                self.replay_buffer.restore_from_linearized(data['states'], data['policies'], data['values'], cursor, advantages=adv)
-                logger.info(f"  回放缓冲区恢复: {len(data['states']):,} 样本")
-
-            phase_msg = "完整迭代" if self.current_phase == 0 else f"阶段{self.current_phase}"
-            logger.info(f"  ✓ 恢复至迭代 {self.current_iteration+1} | 阶段: {phase_msg} | "
-                       f"最佳胜率: {self.best_win_rate:.1%} | 缓冲区: {self.replay_buffer.size:,}")
-            return True
-        except Exception as e:
-            logger.error(f"加载检查点失败: {e}"); return False
 
     # -------------------- 打印 --------------------
 
@@ -687,15 +522,14 @@ class AgentPreTrainer:
         c = self.config
         total_p = sum(p.numel() for p in self.model.parameters())
         logger.info("=" * 70)
-        logger.info("  五子棋预训练: 神经网络 vs AgentAD (合并成熟版 v9.5)")
+        logger.info("  五子棋预训练: 神经网络 vs AgentAD (极简版 v11.0)")
         logger.info("=" * 70)
         logger.info(f"  网络: {c.num_res_blocks} Blocks × {c.channels} Ch | 参数量: {total_p:,}")
         logger.info(f"  对手: AgentAD (depth={c.agent_depth}, cand={c.agent_max_candidates}, vct={c.agent_vct_depth})")
         logger.info(f"  轮次: {c.num_iterations} × {c.games_per_iteration}局/轮 | MCTS: {c.num_sims}次模拟")
-        logger.info(f"  策略损失: 标准交叉熵 (MCTS分布已编码优势，不加权)")
-        logger.info(f"  LR: {c.learning_rate:.1e} Cosine + {c.lr_warmup_iterations}轮Warmup")
+        logger.info(f"  ✅ 对弈即评估，胜率驱动早停，无回退，逻辑极简")
         logger.info(f"  早停: patience={c.early_stop_patience}, min_delta={c.early_stop_min_delta:.0%}")
-        logger.info(f"  评估: 每{c.eval_interval}轮 | {c.eval_games}局 | ✅ 并行(GPU+多Worker+轻量IPC)")
+        logger.info(f"  LR: {c.learning_rate:.1e} Cosine + {c.lr_warmup_iterations}轮Warmup")
         logger.info("=" * 70)
 
     # -------------------- 主循环 --------------------
@@ -703,66 +537,64 @@ class AgentPreTrainer:
     def run(self):
         model_path = os.path.join(self.config.checkpoint_dir, 'self_play_model.pt')
         os.makedirs(self.config.checkpoint_dir, exist_ok=True)
-        if not os.path.exists(model_path):
-            torch.save({'model_state_dict': self.model.state_dict()}, model_path)
 
         for iteration in range(self.current_iteration, self.config.num_iterations):
-            if self._should_stop: break
             self.current_iteration = iteration
             iter_start = time.time()
             logger.info(f"\n{'='*60}\n  预训练迭代 {iteration+1} / {self.config.num_iterations}\n{'='*60}")
 
-            if self.current_phase < 1:
-                logger.info("[阶段1] 与 AgentAD 对弈...")
-                samples, play_win_rate = agent_play_phase_parallel(
-                    model_path=model_path, device_str=str(self.device),
-                    num_games=self.config.games_per_iteration, temp_threshold=self.config.temp_threshold,
-                    num_workers=self.config.num_workers, max_batch_size=self.config.max_batch_size,
-                    config=self.config, iteration_idx=iteration,
-                )
-                if samples:
-                    states = np.array([s[0] for s in samples], dtype=np.float32)
-                    policies = np.array([s[1] for s in samples], dtype=np.float32)
-                    values = np.array([s[2] for s in samples], dtype=np.float32)
-                    advantages = np.array([s[3] for s in samples], dtype=np.float32)
-                    self.replay_buffer.add(states, policies, values, advantages)
-                logger.info(f"  缓冲区: {len(self.replay_buffer):,} 样本")
-                self.current_phase = 1; self._save_checkpoint(phase=1)
-            else:
-                logger.info("[阶段1] 跳过(已在上次完成)"); play_win_rate = 0.0
+            # ── 1. 模型同步 ──
+            # 强制将当前内存模型写入对弈用文件，保证对弈胜率归属绝对清晰
+            torch.save({'model_state_dict': self.model.state_dict()}, model_path)
+            logger.info(f"[1.同步] 当前模型 -> {os.path.basename(model_path)}")
 
-            if self.current_phase < 2:
-                logger.info("[阶段2] 网络训练...")
-                train_metrics = self._train_phase(iteration)
-                torch.save({'model_state_dict': self.model.state_dict()}, model_path)
-                self.current_phase = 2
-                should_save_replay = (iteration + 1) % 3 == 0
-                self._save_checkpoint(phase=2, save_replay=should_save_replay)
-                logger.info("  ★ 阶段1&2已安全保存")
-            else:
-                logger.info("[阶段2] 跳过(已在上次完成)")
+            # ── 2. 对弈 + 评估 ──
+            logger.info("[2.对弈] 与 AgentAD 对弈并收集数据...")
+            samples, play_win_rate = agent_play_phase_parallel(
+                model_path=model_path, device_str=str(self.device),
+                num_games=self.config.games_per_iteration, temp_threshold=self.config.temp_threshold,
+                num_workers=self.config.num_workers, max_batch_size=self.config.max_batch_size,
+                config=self.config, iteration_idx=iteration,
+            )
 
+            # 添加样本到缓冲区
+            if samples:
+                states = np.array([s[0] for s in samples], dtype=np.float32)
+                policies = np.array([s[1] for s in samples], dtype=np.float32)
+                values = np.array([s[2] for s in samples], dtype=np.float32)
+                advantages = np.array([s[3] for s in samples], dtype=np.float32)
+                self.replay_buffer.add(states, policies, values, advantages)
+            logger.info(f"  缓冲区: {len(self.replay_buffer):,} 样本")
+
+            # ── 3. 胜率判断 + 早停 ──
             is_best = False
-            should_eval = (iteration + 1) % self.config.eval_interval == 0 or iteration == 0
+            if play_win_rate > self.best_win_rate + self.config.early_stop_min_delta:
+                self.best_win_rate = play_win_rate
+                self.es_counter = 0
+                is_best = True
+                logger.info(f"  ★ 新最佳胜率: {play_win_rate:.1%} (历史最佳)")
+            else:
+                self.es_counter += 1
+                logger.info(f"  胜率 {play_win_rate:.1%} 未超最佳 {self.best_win_rate:.1%} "
+                           f"(连续未改善 {self.es_counter}/{self.config.early_stop_patience})")
 
-            if should_eval:
-                eval_win_rate = self._evaluate_vs_agent()
-                self.iteration_stats.append({'type': 'eval', 'iteration': iteration, 'win_rate': eval_win_rate, 'play_win_rate': play_win_rate})
-                if eval_win_rate > self.best_win_rate + self.config.early_stop_min_delta:
-                    self.best_win_rate = eval_win_rate; self.es_counter = 0; is_best = True
-                else:
-                    self.es_counter += 1
-                    logger.info(f"  胜率未提升 (ES {self.es_counter}/{self.config.early_stop_patience})")
-                if self.es_counter >= self.config.early_stop_patience:
-                    logger.info(f"  ⚠ 早停触发！胜率连续{self.config.early_stop_patience}轮未改善")
-                    self.current_phase = 0; self._save_checkpoint(is_best=is_best, phase=0); break
-            else: is_best = True
+            if self.es_counter >= self.config.early_stop_patience:
+                logger.info(f"  ⚠ 早停触发！胜率连续{self.es_counter}轮未改善，结束训练")
+                self._save_checkpoint(is_best=is_best)
+                break
 
-            self.current_phase = 0; self._save_checkpoint(is_best=is_best, phase=0)
+            # ── 4. 训练 ──
+            logger.info("[3.训练] 更新网络权重...")
+            self._train_phase(iteration)
+
+            # ── 5. 存档 ──
+            self._save_checkpoint(is_best=is_best)
             iter_time = time.time() - iter_start
-            logger.info(f"  迭代总结: {iter_time:.0f}s | 历史最佳胜率: {self.best_win_rate:.1%}")
+            logger.info(f"  迭代完成: {iter_time:.0f}s | 本次胜率: {play_win_rate:.1%} | "
+                       f"历史最佳: {self.best_win_rate:.1%}")
 
-        torch.save({'model_state_dict': self.model.state_dict()}, os.path.join(self.config.checkpoint_dir, 'final_model.pt'))
+        torch.save({'model_state_dict': self.model.state_dict()},
+                   os.path.join(self.config.checkpoint_dir, 'final_model.pt'))
         logger.info(f"\n✓ 预训练完成！最佳胜率: {self.best_win_rate:.1%}")
         logger.info(f"  可用 best_model.pt 作为 az_train.py 的 --initial_model")
 
@@ -779,8 +611,6 @@ def main():
     parser.add_argument('--workers', type=int, default=None)
     parser.add_argument('--no-save-images', action='store_true', default=False)
     parser.add_argument('--save-image-every', type=int, default=None)
-    parser.add_argument('--no-save-eval-images', action='store_true', default=False)
-    parser.add_argument('--resume', action='store_true', default=False)
     args = parser.parse_args()
 
     config = PretrainConfig()
@@ -792,8 +622,6 @@ def main():
     if args.workers is not None: config.num_workers = args.workers
     if args.no_save_images: config.save_images = False
     if args.save_image_every is not None: config.save_image_every_n_games = args.save_image_every
-    if args.no_save_eval_images: config.save_eval_images = False
-    if args.resume: config.initial_model = None
 
     trainer = AgentPreTrainer(config)
     trainer.run()
