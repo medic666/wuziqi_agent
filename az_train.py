@@ -472,7 +472,9 @@ class AlphaZeroTrainer:
         # 修复: 避免 0 × (-inf) = NaN
         log_policy_safe = torch.where(policies_t > 0, log_policy, torch.zeros_like(log_policy))
         
-        policy_loss = -(policies_t * log_policy_safe * advantages_t).sum(dim=1).mean()
+        # ✅ 修改：标准交叉熵（去掉 advantage 加权）
+        # MCTS 访问次数分布已经编码了优势信息，无需重复加权
+        policy_loss = -(policies_t * log_policy_safe).sum(dim=1).mean()
         value_loss = self.value_loss_fn(pred_vals, values_t)
         loss = self.config.policy_loss_weight * policy_loss + self.config.value_loss_weight * value_loss
         
