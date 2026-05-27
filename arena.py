@@ -1,7 +1,7 @@
 # arena.py
 """
 五子棋可视化对弈竞技场
-(修复: 移除自导入, 兼容新 gamerules 的 is_board_full)
+(修复: 移除自导入, 兼容新 gamerules 的 is_board_full, 新增 AZAgent 神经网络对战)
 """
 
 import tkinter as tk
@@ -9,11 +9,124 @@ from tkinter import ttk
 import time
 import threading
 from typing import Optional
+
+import torch
+import numpy as np
+
 from gamerules import GameState, GomokuRules
 from agent_base import Agent
+from network import ActorCriticNet
+from mcts import MCTS, create_local_eval_fn
+
+
+# ═══════════════════════════════════════════════════════════════
+#  AZAgent: AlphaZero 神经网络 Agent
+# ═══════════════════════════════════════════════════════════════
+
+class AZAgent:
+    """AlphaZero 神经网络 Agent，使用 MCTS + 神经网络进行决策
+
+    支持树复用：在连续走子间复用 MCTS 搜索树，大幅减少重复计算。
+    参考:
+      - az_train._arena_phase: create_local_eval_fn 创建本地评估函数
+      - pretrain_vs_agent.worker_loop_vs_agent: MCTS 树两步复用模式
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        num_sims: int = 400,
+        c_puct: float = 2.5,
+        temperature: float = 0.0,
+        dirichlet_alpha: float = 0.2,
+        dirichlet_epsilon: float = 0.0,
+        candidate_radius: int = 3,
+        advantage_clip: float = 1.0,
+        name: str = "AlphaZero",
+        device: str = "auto",
+    ):
+        self.name = name
+        self.temperature = temperature
+
+        # ── 确定设备 ──
+        if device == "auto":
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
+
+        # ── 加载模型（参考 inference_server 的加载逻辑，自动推断架构） ──
+        ckpt = torch.load(model_path, map_location=self.device, weights_only=False)
+        state_dict = ckpt.get('model_state_dict', ckpt)
+
+        channels = state_dict['stem_conv.weight'].shape[0]
+        res_block_indices = [
+            int(k.split('.')[1]) for k in state_dict if k.startswith('res_blocks.')
+        ]
+        num_blocks = max(res_block_indices) + 1 if res_block_indices else 4
+
+        self.model = ActorCriticNet(
+            num_res_blocks=num_blocks, channels=channels
+        ).to(self.device)
+        self.model.load_state_dict(state_dict)
+        self.model.eval()
+
+        if self.device.type == 'cuda':
+            torch.backends.cudnn.benchmark = True
+
+        # ── 创建 MCTS（参考 az_train._arena_phase 的做法） ──
+        eval_fn = create_local_eval_fn(self.model, self.device)
+        self.mcts = MCTS(
+            eval_fn=eval_fn,
+            c_puct=c_puct,
+            num_simulations=num_sims,
+            dirichlet_alpha=dirichlet_alpha,
+            dirichlet_epsilon=dirichlet_epsilon,
+            candidate_radius=candidate_radius,
+            advantage_clip=advantage_clip,
+        )
+
+        self._my_last_action = None
+
+    def new_game(self):
+        """新一局开始时调用，重置搜索树和记录"""
+        self.mcts.root = None
+        self._my_last_action = None
+
+    def get_move(self, state):
+        """选择落子，支持 MCTS 树复用
+
+        树复用逻辑（参考 pretrain_vs_agent.worker_loop_vs_agent）：
+          1. 先推进过自己上一步的子节点（手动推进）
+          2. 再通过 search(last_action=对手上一步) 推进过对手的子节点（MCTS 内部处理）
+          3. 在复用后的子树上继续搜索，避免每步从零开始
+        """
+        # 步骤1: 推进过自己上一步
+        #   搜索结束后，root 的 children 包含自己的候选动作
+        #   推进到实际选择的那步，其 children 就是对手的候选响应
+        if self._my_last_action is not None and self.mcts.root is not None:
+            if self._my_last_action in self.mcts.root.children:
+                child = self.mcts.root.children[self._my_last_action]
+                child.parent = None  # 切断反向传播链接，防止内存泄漏
+                self.mcts.root = child
+            else:
+                self.mcts.root = None
+
+        # 步骤2: search 内部通过 last_action 推进过对手上一步，并在复用子树上搜索
+        #   state.last_move 就是对手的落子，传给 search 实现自动树复用
+        _, action, _ = self.mcts.search(
+            state, temperature=self.temperature, last_action=state.last_move
+        )
+
+        self._my_last_action = action
+        return action
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Arena: 可视化对弈竞技场
+# ═══════════════════════════════════════════════════════════════
 
 class Arena:
-    def __init__(self, agent_black: Agent, agent_white: Agent):
+    def __init__(self, agent_black, agent_white):
         self.agent_black = agent_black
         self.agent_white = agent_white
         self.rules = GomokuRules()
@@ -180,6 +293,14 @@ class Arena:
 
     # ==================== 对局流程 ====================
 
+    def _reset_agents(self):
+        """新一局开始时重置智能体状态（MCTS 树、增量缓存等）"""
+        for agent in [self.agent_black, self.agent_white]:
+            if hasattr(agent, 'new_game'):
+                agent.new_game()
+            elif hasattr(agent, 'reset_incremental_cache'):
+                agent.reset_incremental_cache()
+
     def start_new_game(self):
         self._auto_start_after_id = None
         self.game_num += 1
@@ -206,6 +327,10 @@ class Arena:
 
         self.state = GameState(board=bytearray(225), current_player=1, history=[], last_move=None)
         self.draw_board()
+
+        # ✅ 重置智能体状态（AZAgent 的 MCTS 树、AgentAD 的增量缓存等）
+        self._reset_agents()
+
         self.game_running = True
         self.current_black_agent = black_agent
         self.current_white_agent = white_agent
@@ -328,18 +453,34 @@ class Arena:
             self.status_var.set(f"第 {self.game_num} 局结束 - {result}  [点击「开始新局」继续]")
 
 
-# ✅ 修复：移除自导入 `from arena import Arena`，直接使用类名
+# ═══════════════════════════════════════════════════════════════
+#  入口：示例对局配置
+# ═══════════════════════════════════════════════════════════════
+
 if __name__ == '__main__':
-    from agent import Agent
     from agent_ad import Agent as ADAgent
-    from agent_az import AZAgent
 
-    agent1 = Agent(depth=3, max_candidates=8, use_quiescence=True, quiescence_depth=2, vct_depth=8, name="Agent")
-    agent4 = ADAgent(depth=3, max_candidates=8, use_quiescence=True, quiescence_depth=2, vct_depth=8, name="ADAgent")
+    # ── 普通 AgentAD 对手 ──
+    agent1 = ADAgent(
+        depth=4, max_candidates=10,
+        use_quiescence=True, quiescence_depth=2,
+        vct_depth=8, name="ADAgent"
+    )
 
-    # az_agent = AZAgent(
-    #     model_path="checkpoints/az_train/best_model.pt",
-    #     num_sims=200, temperature=0.0, name="AlphaZero"
-    # )
+    # ── 神经网络 Agent（参考 az_train._arena_phase 的调用方式） ──
+    az_agent1 = AZAgent(
+        model_path="checkpoints/pretrain_vs_agent/best_model_old.pt",
+        num_sims=200,
+        temperature=0.0,       # 确定性走子（竞技场不探索）
+        dirichlet_epsilon=0.0, # 不加 Dirichlet 噪声
+        name="AlphaOld",
+    )
+    az_agent2 = AZAgent(
+        model_path="checkpoints/pretrain_vs_agent/self_play_model.pt",
+        num_sims=200,
+        temperature=0.0,       # 确定性走子（竞技场不探索）
+        dirichlet_epsilon=0.0, # 不加 Dirichlet 噪声
+        name="AlphaCurr",
+    )
 
-    Arena(agent_black=agent1, agent_white=agent4)
+    Arena(agent_black=az_agent1, agent_white=az_agent2)

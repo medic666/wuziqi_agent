@@ -1,4 +1,4 @@
-# agent_ad.py 融合最终版 (评估函数模式匹配重写版 + 增量缓存优化)
+# agent_ad.py 融合最终版 (评估函数模式匹配重写版 + 增量缓存优化 + VCT防卡死修复)
 
 import random
 from typing import List, Tuple, Optional, Dict, Set
@@ -98,8 +98,8 @@ class Agent(BaseAgent):
     }
 
     def __init__(self, depth: int = 4, max_candidates: int = 10, use_quiescence: bool = True,
-                 vct_depth: int = 6, quiescence_depth: int = 4, max_trans_size: int = 1_000_000,
-                 max_nodes: int = 500000, name: str = "Agent"):
+                 vct_depth: int = 8, quiescence_depth: int = 2, max_trans_size: int = 1_000_000,
+                 max_nodes: int = 500000, name: str = "ADAgent"):
         self.name = name
         self.base_depth = depth
         self.base_max_candidates = max_candidates
@@ -369,6 +369,12 @@ class Agent(BaseAgent):
         fives = []
         plate = state.plate
         for r, c in state.candidates:
+            # ✅ 防卡死：节点计数与超时退出
+            self.node_count += 1
+            if self.node_count > self.max_nodes or self.timeout:
+                self.timeout = True
+                return []
+
             idx = r * 15 + c
             if plate[idx] != 0: continue
             if self._quick_evaluate_point(state, r, c, player) >= self.SCORE_FIVE:
@@ -382,16 +388,32 @@ class Agent(BaseAgent):
         potential_fours = []
         plate = state.plate
         for r, c in state.candidates:
+            # ✅ 防卡死：节点计数与超时退出
+            self.node_count += 1
+            if self.node_count > self.max_nodes or self.timeout:
+                self.timeout = True
+                return []
+
             if plate[r * 15 + c] != 0: continue
             if self._quick_evaluate_point(state, r, c, player) >= self.SCORE_RUSH_FOUR:
                 potential_fours.append((r, c))
         if len(potential_fours) > 15: potential_fours = potential_fours[:15]
         fours = []
         for r, c in potential_fours:
+            # ✅ 防卡死：循环前检查超时
+            if self.timeout: return []
+
             idx = r * 15 + c
             plate[idx] = player
             five_moves = []
             for r2, c2 in state.candidates:
+                # ✅ 防卡死：内层节点计数与超时退出
+                self.node_count += 1
+                if self.node_count > self.max_nodes or self.timeout:
+                    self.timeout = True
+                    plate[idx] = 0
+                    return []
+
                 idx2 = r2 * 15 + c2
                 if plate[idx2] != 0: continue
                 if self._quick_evaluate_point(state, r2, c2, player) >= self.SCORE_FIVE:
@@ -403,20 +425,42 @@ class Agent(BaseAgent):
         return fours
 
     def _vct_search(self, state, depth):
+        # ✅ 防卡死：节点计数与超时退出
+        self.node_count += 1
+        if self.node_count > self.max_nodes or self.timeout:
+            self.timeout = True
+            return None
+
         if depth <= 0: return None
         player = state.player; opp = 3 - player
+
+        # ✅ 防卡死：递归内部检查超时
+        if self.timeout: return None
+
         fives = self._find_five_moves(state, player)
+        if self.timeout: return None  # ✅ 防卡死：子函数超时检查
         if fives: return random.choice(fives)
+
         opp_fives = self._find_five_moves(state, opp)
+        if self.timeout: return None  # ✅ 防卡死：子函数超时检查
         if opp_fives: return None
+
         fours = self._get_fours_and_defenses_v2(state, player)
+        if self.timeout: return None  # ✅ 防卡死：子函数超时检查
         if not fours: return None
+
         winning_moves = []
         random.shuffle(fours)
         for move, defenses in fours:
+            # ✅ 防卡死：循环前检查超时
+            if self.timeout: return None
+
             oh, db, dw, add = self.apply_move_full(state, move)
             if self._find_five_moves(state, opp):
                 self.undo_move_full(state, move, oh, db, dw, add); continue
+            if self.timeout:  # ✅ 防卡死：子函数超时检查
+                self.undo_move_full(state, move, oh, db, dw, add); return None
+
             if len(defenses) >= 2:
                 self.undo_move_full(state, move, oh, db, dw, add)
                 winning_moves.append(move); continue
@@ -426,6 +470,8 @@ class Agent(BaseAgent):
             oh2, db2, dw2, add2 = self.apply_move_full(state, def_move)
             result = self._vct_search(state, depth - 1)
             self.undo_move_full(state, def_move, oh2, db2, dw2, add2)
+            if self.timeout:  # ✅ 防卡死：深层递归超时退出
+                self.undo_move_full(state, move, oh, db, dw, add); return None
             if result is not None:
                 self.undo_move_full(state, move, oh, db, dw, add)
                 winning_moves.append(move); continue
@@ -583,11 +629,15 @@ class Agent(BaseAgent):
             return opp_fives[0]
         quick = self._sort_candidates(state)
         if len(quick) == 1: return quick[0]
+
+        # ✅ 修复：在 VCT 搜索前清零，让 max_nodes 限制生效
+        self.node_count = 0
+        self.timeout = False
+
         if self.vct_depth > 0:
             vct_move = self._vct_search(state, self.vct_depth)
             if vct_move is not None: return vct_move
-        self.node_count = 0
-        self.timeout = False
+
         root_scores = {}
         for d in range(1, self.depth + 1):
             alpha = -float('inf')

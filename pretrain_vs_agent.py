@@ -1,10 +1,11 @@
 # pretrain_vs_agent.py
 """
-五子棋神经网络预训练模块：与 AgentAD 对弈 (极简版) v11.0
+五子棋神经网络预训练模块：与 AgentAD 对弈 (极简版) v11.1
 
 核心逻辑：对弈即评估，胜率驱动早停
   流程：对弈 → 记录胜率 → 早停判断 → 训练 → 循环
   模型同步：对弈前 model->pt，新高时 model->best
+  ✅ v11.1: 修复对弈阶段 MCTS 树复用，避免每步从零搜索导致速度极慢
 """
 
 import os
@@ -50,28 +51,28 @@ class PretrainConfig:
 
     # 预训练轮次
     num_iterations: int = 50
-    games_per_iteration: int = 200
+    games_per_iteration: int = 100
 
     # MCTS
     num_sims: int = 400
     c_puct: float = 1.5
     dirichlet_alpha: float = 0.2
-    dirichlet_epsilon: float = 0 #不要探索因为agent对手本身很随机
+    dirichlet_epsilon: float = 0 #关掉噪声因为对手agent比较随机
     temp_threshold: int = 6
     candidate_radius: int = 3
     advantage_clip: float = 1.0
 
     # AgentAD 对手
-    agent_depth: int = 2
-    agent_max_candidates: int = 8
+    agent_depth: int = 4
+    agent_max_candidates: int = 10
     agent_use_quiescence: bool = True
-    agent_vct_depth: int = 6
+    agent_vct_depth: int = 8
 
     # 训练
     replay_buffer_size: int = 500000
-    min_replay_size: int = 2000
+    min_replay_size: int = 5000
     batch_size: int = 128
-    train_steps_per_iteration: int = 200
+    train_steps_per_iteration: int = 40
     learning_rate: float = 1e-4
     lr_warmup_iterations: int = 3
     weight_decay: float = 1e-4
@@ -79,16 +80,16 @@ class PretrainConfig:
     value_loss_delta: float = 0.5
 
     # 早停 (仅早停，无回退)
-    early_stop_patience: int = 10
+    early_stop_patience: int = 15
     early_stop_min_delta: float = 0.02
 
     # 多进程
-    num_workers: int = 8
+    num_workers: int = 16
     max_batch_size: int = 128
 
     # 存档
     checkpoint_dir: str = "checkpoints/pretrain_vs_agent"
-    initial_model: Optional[str] = "checkpoints/joint_pretrain/best_model.pt"
+    initial_model: Optional[str] = "checkpoints/pretrain_vs_agent/best_model_old.pt"
 
     # 图片保存配置
     save_images: bool = True
@@ -247,18 +248,38 @@ def worker_loop_vs_agent(
             net_player = 1 if net_is_black else 2
             agent._chosen_opening, agent._opening_step = None, 0
             agent.reset_incremental_cache()
-            mcts.root = None
+            mcts.root = None  # 每局开始重置树
 
             while move_count < BOARD_SQUARES:
                 is_net_turn = (state.current_player == net_player)
+                
                 if is_net_turn:
+                    # ---- 网络走子 ----
                     temperature = 1.0 if move_count < temp_threshold else 1e-3
                     mcts_policy, action, advantages = mcts.search(state, temperature=temperature, last_action=None)
                     states_list.append(state_to_tensor(state))
                     policies_list.append(mcts_policy)
                     advantages_list.append(advantages)
+                    
+                    # ✅【关键修复】树复用：网络走子后，将 root 推进到对应的子节点
+                    if mcts.root is not None and action in mcts.root.children:
+                        child = mcts.root.children[action]
+                        child.parent = None  # 切断反向传播链接，防止内存泄漏
+                        mcts.root = child
+                    else:
+                        mcts.root = None
                 else:
+                    # ---- AgentAD 走子 ----
                     action = agent.get_move(state)
+                    
+                    # ✅【关键修复】树复用：对手走子后，同样将 root 推进到对应的子节点
+                    # 如果对手走了一步 MCTS 之前没探索过的点，树只能作废（root=None）
+                    if mcts.root is not None and action in mcts.root.children:
+                        child = mcts.root.children[action]
+                        child.parent = None
+                        mcts.root = child
+                    else:
+                        mcts.root = None
 
                 GomokuRules.apply_move_fast(state, action)
                 move_count += 1
@@ -471,7 +492,7 @@ class AgentPreTrainer:
         new_lr = self._get_lr(iteration)
         for pg in self.optimizer.param_groups: pg['lr'] = new_lr
 
-        steps = min(self.config.train_steps_per_iteration, len(self.replay_buffer) // self.config.batch_size)
+        steps = min(self.config.train_steps_per_iteration, len(self.replay_buffer) // self.config.batch_size//2)
         steps = max(steps, 20)
         metrics_sum = {}; valid_steps = 0
         pbar = tqdm(range(steps), desc="  训练", leave=False)
@@ -522,12 +543,13 @@ class AgentPreTrainer:
         c = self.config
         total_p = sum(p.numel() for p in self.model.parameters())
         logger.info("=" * 70)
-        logger.info("  五子棋预训练: 神经网络 vs AgentAD (极简版 v11.0)")
+        logger.info("  五子棋预训练: 神经网络 vs AgentAD (极简版 v11.1)")
         logger.info("=" * 70)
         logger.info(f"  网络: {c.num_res_blocks} Blocks × {c.channels} Ch | 参数量: {total_p:,}")
         logger.info(f"  对手: AgentAD (depth={c.agent_depth}, cand={c.agent_max_candidates}, vct={c.agent_vct_depth})")
         logger.info(f"  轮次: {c.num_iterations} × {c.games_per_iteration}局/轮 | MCTS: {c.num_sims}次模拟")
         logger.info(f"  ✅ 对弈即评估，胜率驱动早停，无回退，逻辑极简")
+        logger.info(f"  ✅ MCTS 树两步复用（对弈速度大幅提升）")
         logger.info(f"  早停: patience={c.early_stop_patience}, min_delta={c.early_stop_min_delta:.0%}")
         logger.info(f"  LR: {c.learning_rate:.1e} Cosine + {c.lr_warmup_iterations}轮Warmup")
         logger.info("=" * 70)
