@@ -1,7 +1,7 @@
 # az_train.py
 """
 五子棋 AlphaZero 训练主循环
-(改进版v9.3: 优势裁剪 + HuberLoss + Cosine LR/Warmup + 两阶段安全存档 + 竞技场棋谱快照 + 动态任务分配 + 自弈用最新模型 + 竞技场数据回收 + 竞技场树复用)
+(改进版v9.4: 优势裁剪 + HuberLoss + Cosine LR/Warmup + 两阶段安全存档 + 竞技场棋谱快照 + 动态任务分配 + 自弈用最新模型 + 竞技场数据回收 + 竞技场/基准评估完美树复用)
 """
 
 import os
@@ -45,23 +45,35 @@ class AlphaZeroConfig:
         channels: int = 128,
         board_size: int = 15,
         num_iterations: int = 200,
-        games_per_iteration: int = 500,
+
+        games_per_iteration: int = 200,     #基数为1X100
+        train_steps_per_iteration: int = 80,  #基数为1X40
+        baseline_eval_games: int = 40, #基数为1X20
+        arena_games: int = 40,   #基数为1X20
+        
         num_sims: int = 400,
         c_puct: float = 2.5,
         dirichlet_alpha: float = 0.2,
         dirichlet_epsilon: float = 0.25,
-        temp_threshold: int = 20,
-        candidate_radius: int = 3,
+        temp_threshold: int = 8,          # 自对弈前N步使用高温(1.0)，之后使用低温(1e-3)
+        candidate_radius: int = 2,
         advantage_clip: float = 1.0,
-        arena_games: int = 50,
         arena_win_threshold: float = 0.6,
         arena_num_sims: int = 400,
+        arena_c_puct: float = 2.5,
+        arena_dirichlet_alpha: float = 0.2,
+        arena_dirichlet_epsilon: float = 0.0,
+        arena_temperature: float = 1e-3,
+        arena_temp_threshold: int = 8,     # 新增：竞技场前N步使用高温(1.0)，之后使用低温(arena_temperature)
+        arena_collapse_threshold: float = 0.35,
         arena_save_image_every_n_games: int = 5,
-        arena_data_to_buffer: bool = True,  # ✅ 新增：竞技场数据是否加入回放缓冲区
+        arena_data_to_buffer: bool = True,
+        baseline_num_sims: int = 400,
+        baseline_agent_depth: int = 4,
+        baseline_agent_max_candidates: int = 10,
         replay_buffer_size: int = 500000,
         min_replay_size: int = 5000,
         batch_size: int = 128,
-        train_steps_per_iteration: int = 200,
         learning_rate: float = 1e-4,
         lr_warmup_iterations: int = 5,
         weight_decay: float = 1e-4,
@@ -78,9 +90,6 @@ class AlphaZeroConfig:
         device: str = "auto",
         initial_model: Optional[str] = "checkpoints/joint_pretrain/best_model.pt",
         resume: bool = False,
-        baseline_eval_interval: int = 10,
-        baseline_eval_games: int = 100,
-        arena_collapse_threshold: float = 0.35,
     ):
         for k, v in locals().items():
             if k != 'self':
@@ -235,6 +244,100 @@ def worker_loop(
                 break
 
     output_queue.put(("DONE", worker_id, games_done_by_me))
+
+
+def baseline_eval_worker(
+    worker_id, request_queue, result_queue, task_queue, output_queue,
+    baseline_num_sims, arena_c_puct, arena_dirichlet_alpha, arena_dirichlet_epsilon,
+    candidate_radius, advantage_clip, arena_temperature,
+    agent_depth, agent_max_candidates
+):
+    """基准评估多进程 Worker (完美树复用)"""
+    try:
+        from agent_ad import Agent as AgentAD
+    except ImportError:
+        output_queue.put(("FATAL", worker_id, "ImportError"))
+        return
+
+    agent = AgentAD(depth=agent_depth, max_candidates=agent_max_candidates, name="RuleBaseline")
+    
+    def server_eval_fn(state_np):
+        request_queue.put((worker_id, state_np))
+        try:
+            policy, value = result_queue.get(timeout=60)
+        except queue.Empty:
+            raise RuntimeError("推理服务器超时(60s)")
+        if policy is None:
+            raise RuntimeError("推理服务器返回异常")
+        return policy, value
+
+    mcts = MCTS(
+        eval_fn=server_eval_fn, c_puct=arena_c_puct, num_simulations=baseline_num_sims,
+        dirichlet_alpha=arena_dirichlet_alpha, dirichlet_epsilon=arena_dirichlet_epsilon,
+        candidate_radius=candidate_radius, advantage_clip=advantage_clip,
+    )
+
+    while True:
+        try:
+            task = task_queue.get(timeout=5)
+        except queue.Empty:
+            break
+        if task is None:
+            break
+            
+        game_idx = task
+        try:
+            state = GameState(board=bytearray(BOARD_SQUARES), current_player=1, history=[], last_move=None)
+            az_is_black = (game_idx % 2 == 0)
+            az_player = 1 if az_is_black else 2
+            
+            if hasattr(agent, '_chosen_opening'): agent._chosen_opening = None
+            if hasattr(agent, '_opening_step'): agent._opening_step = 0
+            if hasattr(agent, 'reset_incremental_cache'): agent.reset_incremental_cache()
+            
+            # ★ 树复用状态跟踪
+            mcts.root = None
+            last_az_action = None
+            last_opp_action = None
+            
+            while True:
+                is_az_turn = (state.current_player == az_player)
+                if is_az_turn:
+                    # AZ思考：传入对手上一步的动作，让MCTS内部复用树
+                    mcts_policy, action, advantages = mcts.search(state, temperature=arena_temperature, last_action=last_opp_action)
+                    last_az_action = action
+                    
+                    # AZ下完后，手动将MCTS的root推进到AZ选的动作，为两步后的复用做准备
+                    if mcts.root is not None and action in mcts.root.children:
+                        child = mcts.root.children[action]
+                        child.parent = None
+                        mcts.root = child
+                    else:
+                        mcts.root = None
+                else:
+                    action = agent.get_move(state)
+                    last_opp_action = action
+                    
+                    # 对手下完后，手动将MCTS的root推进到对手选的动作，为AZ下次思考传入做准备
+                    if mcts.root is not None and action in mcts.root.children:
+                        child = mcts.root.children[action]
+                        child.parent = None
+                        mcts.root = child
+                    else:
+                        mcts.root = None
+                        
+                GomokuRules.apply_move_fast(state, action)
+                winner = GomokuRules.check_winner(state)
+                if winner is not None:
+                    break
+            
+            output_queue.put((winner, az_player))
+            
+        except Exception as e:
+            logger.error(f"Eval Worker {worker_id} 游戏 {game_idx} 出错: {e}")
+            output_queue.put(None)
+
+    output_queue.put(("DONE", worker_id))
 
 
 def self_play_phase_parallel(
@@ -426,6 +529,11 @@ class AlphaZeroTrainer:
                 )
                 logger.info(f"  回放缓冲区恢复: {len(data['states']):,} 样本")
 
+            # ★ 修复: 恢复后强制用检查点中的best_model覆写磁盘上的best_model.pt
+            # 防止崩溃前 best_model.pt 已更新但 checkpoint 未更新造成的不一致
+            best_path = os.path.join(self.config.checkpoint_dir, 'best_model.pt')
+            torch.save({'model_state_dict': self.best_model.state_dict()}, best_path)
+
             phase_msg = "完整迭代" if self.current_phase == 0 else f"阶段{self.current_phase}"
             logger.info(f"  ✓ 恢复至迭代 {self.current_iteration + 1} | 阶段: {phase_msg} | 缓冲区 {self.replay_buffer.size:,} 样本")
             return True
@@ -440,13 +548,15 @@ class AlphaZeroTrainer:
         logger.info("  五子棋 AlphaZero 训练系统 (优势裁剪 + HuberLoss + Cosine LR/Warmup)")
         logger.info("=" * 70)
         logger.info(f"  网络: {c.num_res_blocks} Blocks × {c.channels} Ch | 参数量: {total_p:,}")
-        logger.info(f"  自弈: {c.games_per_iteration}局/轮 × {c.num_sims}次模拟 | 8向增强: ON | 树复用: ON")
-        logger.info(f"  自弈模型: 最新训练模型 (非最佳模型，跟随进化)")
+        logger.info(f"  自弈: {c.games_per_iteration}局/轮 × {c.num_sims}次模拟 | 前{c.temp_threshold}步T=1.0,之后T=1e-3 | 8向增强: ON | 树复用: ON")
+        logger.info(f"  自弈模型: 最佳模型 (标准AlphaZero流程)")
         logger.info(f"  优势裁剪: ±{c.advantage_clip} | 值损失: Huber(δ={c.value_loss_delta})")
         logger.info(f"  LR: {c.learning_rate:.1e} Cosine + {c.lr_warmup_iterations}轮Warmup")
-        logger.info(f"  竞技场: {c.arena_games}局, 阈值={c.arena_win_threshold}, "
-                   f"崩溃阈值={c.arena_collapse_threshold}")
+        logger.info(f"  竞技场: {c.arena_games}局, 阈值={c.arena_win_threshold}, 崩溃阈值={c.arena_collapse_threshold}")
+        logger.info(f"  竞技场MCTS: {c.arena_num_sims}次模拟, c_puct={c.arena_c_puct}, epsilon={c.arena_dirichlet_epsilon}")
+        logger.info(f"  竞技场温度: 前{c.arena_temp_threshold}步T=1.0,之后T={c.arena_temperature}")
         logger.info(f"  竞技场数据回收: {'✓ 开启' if c.arena_data_to_buffer else '✗ 关闭'}")
+        logger.info(f"  基准评估: {c.baseline_eval_games}局(并行), Agent深度={c.baseline_agent_depth}")
         logger.info("=" * 70)
 
     def _train_step(self, states, policies, values, advantages):
@@ -471,11 +581,8 @@ class AlphaZeroTrainer:
         logits_flat = logits.view(logits.size(0), -1)
         log_policy = F.log_softmax(logits_flat, dim=1)
         
-        # 修复: 避免 0 × (-inf) = NaN
         log_policy_safe = torch.where(policies_t > 0, log_policy, torch.zeros_like(log_policy))
         
-        # ✅ 修改：标准交叉熵（去掉 advantage 加权）
-        # MCTS 访问次数分布已经编码了优势信息，无需重复加权
         policy_loss = -(policies_t * log_policy_safe).sum(dim=1).mean()
         value_loss = self.value_loss_fn(pred_vals, values_t)
         loss = self.config.policy_loss_weight * policy_loss + self.config.value_loss_weight * value_loss
@@ -501,7 +608,7 @@ class AlphaZeroTrainer:
             pg['lr'] = new_lr
 
         buffer_samples = len(self.replay_buffer)
-        max_steps = buffer_samples // self.config.batch_size
+        max_steps = buffer_samples // self.config.batch_size // 2
         steps = min(self.config.train_steps_per_iteration, max_steps)
         steps = max(steps, 20)
 
@@ -519,27 +626,30 @@ class AlphaZeroTrainer:
         if valid_steps == 0:
             logger.warning("⚠️ 本轮训练所有步骤均产生NaN，请检查模型状态")
             return {'train_loss': float('nan'), 'train_policy_loss': float('nan'), 
-                    'train_value_loss': float('nan'), 'lr': new_lr}
+                    'train_value_loss': float('nan'), 'lr': new_lr, 'train_steps': steps, 'valid_steps': 0}
         
+        # ★ 新增：返回训练步数
         return {
             'train_loss': total_loss / valid_steps,
             'train_policy_loss': total_policy / valid_steps,
             'train_value_loss': total_value / valid_steps,
             'lr': new_lr,
+            'train_steps': steps,
+            'valid_steps': valid_steps,
         }
 
     def _arena_phase(self, iteration: int) -> Tuple[bool, list]:
         logger.info(f"  竞技场: 新模型 vs 最佳模型 ({self.config.arena_games} 局)")
         mcts_new = MCTS(
             eval_fn=create_local_eval_fn(self.new_model, self.device),
-            c_puct=self.config.c_puct, num_simulations=self.config.arena_num_sims,
-            dirichlet_alpha=self.config.dirichlet_alpha, dirichlet_epsilon=0.0,
+            c_puct=self.config.arena_c_puct, num_simulations=self.config.arena_num_sims,
+            dirichlet_alpha=self.config.arena_dirichlet_alpha, dirichlet_epsilon=self.config.arena_dirichlet_epsilon,
             candidate_radius=self.config.candidate_radius, advantage_clip=self.config.advantage_clip,
         )
         mcts_best = MCTS(
             eval_fn=create_local_eval_fn(self.best_model, self.device),
-            c_puct=self.config.c_puct, num_simulations=self.config.arena_num_sims,
-            dirichlet_alpha=self.config.dirichlet_alpha, dirichlet_epsilon=0.0,
+            c_puct=self.config.arena_c_puct, num_simulations=self.config.arena_num_sims,
+            dirichlet_alpha=self.config.arena_dirichlet_alpha, dirichlet_epsilon=self.config.arena_dirichlet_epsilon,
             candidate_radius=self.config.candidate_radius, advantage_clip=self.config.advantage_clip,
         )
 
@@ -547,56 +657,52 @@ class AlphaZeroTrainer:
         os.makedirs(arena_image_dir, exist_ok=True)
 
         new_wins, best_wins, draws = 0, 0, 0
-        all_arena_samples = []  # ✅ 收集竞技场训练数据
+        all_arena_samples = []
 
         for game_idx in range(self.config.arena_games):
             state = GameState(board=bytearray(BOARD_SQUARES), current_player=1, history=[], last_move=None)
             new_is_black = (game_idx % 2 == 0)
             
-            # ✅ 每局开始重置搜索树和复用记录
+            # ★ 竞技场完美树复用追踪
             mcts_new.root = None
             mcts_best.root = None
-            new_last_action = None
-            best_last_action = None
+            last_action_for_new = None
+            last_action_for_best = None
 
-            game_data = []  # ✅ 本局数据: [(state_tensor, policy, advantages, current_player), ...]
+            game_data = []
             
             while True:
                 is_new_turn = (state.current_player == 1) == new_is_black
-                mcts = mcts_new if is_new_turn else mcts_best
+                current_mcts = mcts_new if is_new_turn else mcts_best
+                current_last_action = last_action_for_new if is_new_turn else last_action_for_best
 
-                # ✅ 树复用 Step1: 推进过自己上一步的子节点
-                #   上次搜索结束后，root 的 children 包含自己的候选动作
-                #   推进到实际选择的那步，其 children 就是对手的候选响应
-                my_last = new_last_action if is_new_turn else best_last_action
-                if my_last is not None and mcts.root is not None:
-                    if my_last in mcts.root.children:
-                        child = mcts.root.children[my_last]
-                        child.parent = None  # 切断反向传播链接，防止内存泄漏
-                        mcts.root = child
-                    else:
-                        mcts.root = None
-
-                # ✅ 树复用 Step2: search 内部通过 last_action 推进过对手上一步
-                #   state.last_move 就是对手的落子，传给 search 实现自动树复用
-                mcts_policy, action, advantages = mcts.search(
-                    state, temperature=1e-3, last_action=state.last_move
+                move_count = len(state.history)
+                temperature = 1.0 if move_count < self.config.arena_temp_threshold else self.config.arena_temperature
+                
+                # 传入对手上一步的动作以复用树
+                mcts_policy, action, advantages = current_mcts.search(
+                    state, temperature=temperature, last_action=current_last_action
                 )
-
-                # 记录本次选择的动作，供下次树复用
-                if is_new_turn:
-                    new_last_action = action
-                else:
-                    best_last_action = action
-
-                # ✅ 收集训练数据（双方每步都收集，不浪费）
                 game_data.append((state_to_tensor(state), mcts_policy, advantages, state.current_player))
+
+                # 更新对手的 last_action 追踪器
+                if is_new_turn:
+                    last_action_for_best = action
+                else:
+                    last_action_for_new = action
+
+                # 当前玩家下完后，手动将当前MCTS的root推进到选定的动作节点
+                if current_mcts.root is not None and action in current_mcts.root.children:
+                    child = current_mcts.root.children[action]
+                    child.parent = None
+                    current_mcts.root = child
+                else:
+                    current_mcts.root = None
 
                 GomokuRules.apply_move_fast(state, action)
                 winner = GomokuRules.check_winner(state)
                 if winner is not None: break
             
-            # ✅ 根据胜负结果为每步赋值
             for s, p, adv, player in game_data:
                 value = 0.0 if winner == 0 else (1.0 if winner == player else -1.0)
                 all_arena_samples.append((s, p, value, adv))
@@ -624,44 +730,81 @@ class AlphaZeroTrainer:
 
     def _evaluate_baseline(self, iteration: int):
         try:
-            from agent_ad import Agent
-            logger.info(f"[基准评估] 最佳模型 vs 规则引擎...")
-            baseline_agent = Agent(depth=4, max_candidates=10, name="RuleBaseline")
-            mcts_az = MCTS(
-                eval_fn=create_local_eval_fn(self.best_model, self.device),
-                c_puct=self.config.c_puct, num_simulations=200,
-                dirichlet_epsilon=0.0, candidate_radius=self.config.candidate_radius,
-                advantage_clip=self.config.advantage_clip,
-            )
+            from agent_ad import Agent as AgentAD
             
+            logger.info(f"[基准评估] 最佳模型 vs 规则引擎 ({self.config.baseline_eval_games}局, 并行)...")
+            
+            best_model_path = os.path.join(self.config.checkpoint_dir, 'best_model.pt')
+            if not os.path.exists(best_model_path):
+                logger.error("找不到 best_model.pt，跳过基准评估")
+                return
+
+            server = InferenceServer(best_model_path, str(self.device), self.config.num_workers, self.config.max_batch_size)
+            server.ready_event.wait()
+            
+            task_queue = mp.Queue()
+            for i in range(self.config.baseline_eval_games):
+                task_queue.put(i)
+            for _ in range(self.config.num_workers):
+                task_queue.put(None)
+                
+            eval_queues = [server.get_queues(i) for i in range(self.config.num_workers)]
+            output_queue = mp.Queue()
+            
+            processes = []
+            for i in range(self.config.num_workers):
+                req_q, res_q = eval_queues[i]
+                p = mp.Process(target=baseline_eval_worker, args=(
+                    i, req_q, res_q, task_queue, output_queue,
+                    self.config.baseline_num_sims, self.config.arena_c_puct, 
+                    self.config.arena_dirichlet_alpha, self.config.arena_dirichlet_epsilon,
+                    self.config.candidate_radius, self.config.advantage_clip, self.config.arena_temperature,
+                    self.config.baseline_agent_depth, self.config.baseline_agent_max_candidates
+                ), daemon=True)
+                p.start()
+                processes.append(p)
+                
             az_wins, base_wins, draws = 0, 0, 0
+            games_completed = 0
+            workers_done = 0
             num_games = self.config.baseline_eval_games
-            for game_idx in range(num_games):
-                state = GameState(board=bytearray(BOARD_SQUARES), current_player=1, history=[], last_move=None)
-                az_is_black = (game_idx % 2 == 0)
+            
+            pbar = tqdm(total=num_games, desc="基准评估", leave=False)
+            
+            while workers_done < self.config.num_workers:
+                try:
+                    result = output_queue.get(timeout=120)
+                except queue.Empty:
+                    continue
+                    
+                if isinstance(result, tuple) and len(result) >= 2:
+                    if result[0] == "DONE":
+                        workers_done += 1
+                        continue
+                    elif result[0] == "FATAL":
+                        logger.error(f"收到 Eval Worker 致命错误，提前终止")
+                        workers_done = self.config.num_workers
+                        continue
                 
-                mcts_az.root = None
-                
-                while True:
-                    if state.current_player == 1:
-                        agent = mcts_az if az_is_black else baseline_agent
-                    else:
-                        agent = baseline_agent if az_is_black else mcts_az
+                if result is None:
+                    games_completed += 1
+                    pbar.update(1)
+                    continue
                     
-                    if isinstance(agent, Agent): 
-                        action = agent.get_move(state)
-                    else: 
-                        agent.root = None
-                        _, action, _ = agent.search(state, temperature=1e-3, last_action=None)
-                    
-                    GomokuRules.apply_move(state, action)
-                    winner = GomokuRules.check_winner(state)
-                    if winner is not None: break
-                    
+                winner, az_player = result
                 if winner == 0: draws += 1
-                elif (winner == 1 and az_is_black) or (winner == 2 and not az_is_black): az_wins += 1
+                elif winner == az_player: az_wins += 1
                 else: base_wins += 1
                 
+                games_completed += 1
+                pbar.update(1)
+                
+            pbar.close()
+            for p in processes:
+                p.join(timeout=5)
+                if p.is_alive(): p.terminate()
+            server.shutdown()
+            
             win_rate = az_wins / num_games if num_games > 0 else 0
             logger.info(f"  基准评估结果: AZ {az_wins}胜 / 规则 {base_wins}胜 / 平 {draws} | 胜率 {win_rate:.1%}")
             self.iteration_stats.append({
@@ -684,10 +827,11 @@ class AlphaZeroTrainer:
             'iteration_stats': self.iteration_stats,
             'current_phase': phase,
         }
+        # ★ 修复: 先写 latest_checkpoint.pt，作为唯一的事实来源
         torch.save(state, os.path.join(self.config.checkpoint_dir, 'latest_checkpoint.pt'))
-        if is_best:
-            torch.save({'model_state_dict': self.best_model.state_dict()}, 
-                      os.path.join(self.config.checkpoint_dir, 'best_model.pt'))
+        # ★ 修复: 检查点写成功后，再统一写 best_model.pt，确保两文件在磁盘上的一致性
+        torch.save({'model_state_dict': self.best_model.state_dict()}, 
+                  os.path.join(self.config.checkpoint_dir, 'best_model.pt'))
         if save_replay: self._save_replay_buffer()
 
     def _save_replay_buffer(self):
@@ -707,16 +851,10 @@ class AlphaZeroTrainer:
         global_start = time.time()
 
         best_model_path = os.path.join(self.config.checkpoint_dir, 'best_model.pt')
-        # ✅ 核心改动: 自弈使用最新训练模型，而非最佳模型
-        # AlphaZero 原版和 KataGo/Leela 均使用最新模型自弈，让数据随模型进化
-        self_play_model_path = os.path.join(self.config.checkpoint_dir, 'self_play_model.pt')
 
         os.makedirs(self.config.checkpoint_dir, exist_ok=True)
         if not os.path.exists(best_model_path):
             torch.save({'model_state_dict': self.best_model.state_dict()}, best_model_path)
-        # ✅ 首次运行时，自弈模型 = 最佳模型（尚未训练过）
-        if not os.path.exists(self_play_model_path):
-            torch.save({'model_state_dict': self.best_model.state_dict()}, self_play_model_path)
 
         for iteration in range(self.current_iteration, self.config.num_iterations):
             if self._should_stop: break
@@ -727,9 +865,8 @@ class AlphaZeroTrainer:
             # ==================== 阶段 1 ====================
             if self.current_phase < 1:
                 logger.info("[阶段1] 自我对弈...")
-                # ✅ 使用最新训练模型自弈（非最佳模型）
                 samples = self_play_phase_parallel(
-                    model_path=self_play_model_path,
+                    model_path=best_model_path,
                     device_str=str(self.device),
                     num_games=self.config.games_per_iteration, temp_threshold=self.config.temp_threshold,
                     num_workers=self.config.num_workers, max_batch_size=self.config.max_batch_size,
@@ -749,71 +886,68 @@ class AlphaZeroTrainer:
             if self.current_phase < 2:
                 logger.info("[阶段2] 网络训练...")
                 train_metrics = self._train_phase(iteration)
+                # ★ 新增：输出训练步数
                 if train_metrics:
-                    logger.info(f"  训练完成: Loss={train_metrics['train_loss']:.4f} | LR={train_metrics['lr']:.2e}")
-                
-                # ✅ 训练后立即保存最新模型，供下一轮自弈使用
-                torch.save({'model_state_dict': self.new_model.state_dict()}, self_play_model_path)
-                logger.info(f"  ✓ 最新训练模型已保存 → {os.path.basename(self_play_model_path)}")
+                    logger.info(f"  训练完成: Loss={train_metrics['train_loss']:.4f} | "
+                               f"LR={train_metrics['lr']:.2e} | "
+                               f"Steps={train_metrics['train_steps']}(有效={train_metrics['valid_steps']})")
 
                 self.current_phase = 2
-                should_save_replay = (iteration + 1) % self.config.save_replay_interval == 0
-                self._save_checkpoint(iteration, is_best=False, save_replay=should_save_replay, phase=2)
+                # ★ 修复：phase=2 是安全保存点，必须始终保存 replay buffer
+                self._save_checkpoint(iteration, is_best=False, save_replay=True, phase=2)
                 logger.info("  ★ 阶段1&2已完成，进度已安全保存！接下来进入耗时的竞技场评估。")
             else:
                 logger.info("[阶段2] 网络训练... (跳过，已在上次崩溃前完成)")
 
             # ==================== 阶段 3 ====================
             is_best = False
-            if len(self.replay_buffer) >= self.config.min_replay_size:
-                logger.info("[阶段3] 竞技场评估...")
-                is_best, arena_samples = self._arena_phase(iteration)
+            # ★ 新增：显式 phase 守卫
+            if self.current_phase < 3:
+                if len(self.replay_buffer) >= self.config.min_replay_size:
+                    logger.info("[阶段3] 竞技场评估...")
+                    is_best, arena_samples = self._arena_phase(iteration)
 
-                # ✅ 竞技场数据加入回放缓冲区（不浪费每一步宝贵数据）
-                if self.config.arena_data_to_buffer and arena_samples:
-                    a_states = np.array([s[0] for s in arena_samples], dtype=np.float32)
-                    a_policies = np.array([s[1] for s in arena_samples], dtype=np.float32)
-                    a_values = np.array([s[2] for s in arena_samples], dtype=np.float32)
-                    a_advantages = np.array([s[3] for s in arena_samples], dtype=np.float32)
-                    self.replay_buffer.add(a_states, a_policies, a_values, a_advantages)
-                    logger.info(f"  ✓ 竞技场数据已加入缓冲区: +{len(arena_samples)} 样本 | 缓冲区总计 {len(self.replay_buffer):,}")
+                    if self.config.arena_data_to_buffer and arena_samples:
+                        a_states = np.array([s[0] for s in arena_samples], dtype=np.float32)
+                        a_policies = np.array([s[1] for s in arena_samples], dtype=np.float32)
+                        a_values = np.array([s[2] for s in arena_samples], dtype=np.float32)
+                        a_advantages = np.array([s[3] for s in arena_samples], dtype=np.float32)
+                        self.replay_buffer.add(a_states, a_policies, a_values, a_advantages)
+                        logger.info(f"  ✓ 竞技场数据已加入缓冲区: +{len(arena_samples)} 样本 | 缓冲区总计 {len(self.replay_buffer):,}")
 
-                # 获取本轮竞技场胜率
-                arena_win_rate = 0.0
-                for stat in reversed(self.iteration_stats):
-                    if stat.get('type') == 'arena' and stat.get('iteration') == iteration:
-                        arena_win_rate = stat.get('win_rate', 0.0)
-                        break
+                    arena_win_rate = 0.0
+                    for stat in reversed(self.iteration_stats):
+                        if stat.get('type') == 'arena' and stat.get('iteration') == iteration:
+                            arena_win_rate = stat.get('win_rate', 0.0)
+                            break
 
-                if is_best:
-                    # ✅ 新模型胜出 → 更新最佳模型
-                    self.best_model.load_state_dict(self.new_model.state_dict())
-                    torch.save({'model_state_dict': self.best_model.state_dict()}, best_model_path)
-                    logger.info("  ★ 新模型胜出，已更新为最佳模型")
-                elif arena_win_rate < self.config.arena_collapse_threshold:
-                    # ✅ 崩溃保护: 胜率极低时回退到最佳模型，防止灾难性发散
-                    logger.warning(f"  ⚠️ 竞技场胜率极低({arena_win_rate:.1%} < {self.config.arena_collapse_threshold:.0%})，"
-                                 f"紧急回退到最佳模型！")
-                    self.new_model.load_state_dict(self.best_model.state_dict())
-                    # ✅ 回退时重建优化器，清除错位的动量（旧动量属于被丢弃的模型）
-                    self._reset_optimizer()
-                    # 自弈模型也回退到最佳，避免用崩溃模型生成数据
-                    torch.save({'model_state_dict': self.best_model.state_dict()}, self_play_model_path)
+                    if is_best:
+                        self.best_model.load_state_dict(self.new_model.state_dict())
+                        # ★ 修复：移除此处单独保存 best_model.pt，统一由 _save_checkpoint 保存，保证一致性
+
+                        history_dir = os.path.join(self.config.checkpoint_dir, "history_best_models")
+                        os.makedirs(history_dir, exist_ok=True)
+                        history_best_path = os.path.join(history_dir, f'best_model_iter_{iteration+1}.pt')
+                        torch.save({'model_state_dict': self.best_model.state_dict()}, history_best_path)
+
+                        logger.info(f"  ★ 新模型胜出，已更新为最佳模型 (历史快照已保存: {os.path.basename(history_best_path)})")
+                    elif arena_win_rate < self.config.arena_collapse_threshold:
+                        logger.warning(f"  ⚠️ 竞技场胜率极低({arena_win_rate:.1%} < {self.config.arena_collapse_threshold:.0%})，"
+                                     f"紧急回退到最佳模型！")
+                        self.new_model.load_state_dict(self.best_model.state_dict())
+                        self._reset_optimizer()
+                    else:
+                        logger.info(f"  新模型未胜出(胜率{arena_win_rate:.1%})，保留当前权重继续训练")
                 else:
-                    # ✅ 核心改动: 竞技场输了但未崩溃 → 保留当前权重继续训练
-                    # 旧版会 reset new_model = best_model，这导致：
-                    #   1. 丢弃本轮学到的知识（即使52%胜率也比best强了）
-                    #   2. 优化器动量与权重错位，下一步训练不稳定
-                    #   3. 反复 学→丢→学→丢，永远无法累积进步
-                    logger.info(f"  新模型未胜出(胜率{arena_win_rate:.1%})，保留当前权重继续训练")
+                    logger.info("  初期热身: 保持当前最佳模型, 缓冲区不足")
             else:
-                logger.info("  初期热身: 保持当前最佳模型, 缓冲区不足")
+                logger.info("[阶段3] 竞技场评估... (跳过，已在上次崩溃前完成)")
 
+            # ★ 修复：迭代完成后保存 iteration+1，崩溃恢复时不会重复执行已完成的迭代
             self.current_phase = 0
-            self._save_checkpoint(iteration, is_best=is_best, save_replay=False, phase=0)
+            self._save_checkpoint(iteration + 1, is_best=is_best, save_replay=True, phase=0)
 
-            should_eval_baseline = (iteration + 1) % self.config.baseline_eval_interval == 0 or is_best
-            if should_eval_baseline and len(self.replay_buffer) >= self.config.min_replay_size:
+            if is_best and len(self.replay_buffer) >= self.config.min_replay_size:
                 self._evaluate_baseline(iteration)
 
             iter_time = time.time() - iter_start
