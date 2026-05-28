@@ -374,7 +374,7 @@ if __name__ == '__main__':
         name="AlphaOld",
     )
     az_agent2 = AZAgent(
-        model_path="checkpoints/joint_pretrain/best_model.pt",
+        model_path="checkpoints/az_train/best_model.pt",
         num_sims=400,
         temperature=0.0,       # 确定性走子（竞技场不探索）
         dirichlet_epsilon=0.0, # 不加 Dirichlet 噪声
