@@ -2,7 +2,7 @@
 """
 五子棋 AlphaZero 训练主循环
 (改进版v9.6: 优势裁剪 + HuberLoss + Cosine LR/Warmup + 两阶段安全存档 + 竞技场/基准评估完美树复用 + 竞技场双模型并发推理
- + 【修复】ReplayBuffer线性化错位 + 【修复】Collapse脏数据回退 + 【优化】续训/初始化逻辑 + 【优化】原子化存档)
+ + 【修复】ReplayBuffer线性化错位 + 【修复】Collapse脏数据回退 + 【优化】续训/初始化逻辑 + 【优化】原子化存档 + 【修复】NumPy比较警告)
 """
 
 import os
@@ -54,7 +54,7 @@ class AlphaZeroConfig:
         c_puct: float = 2.5,
         dirichlet_alpha: float = 0.2,
         dirichlet_epsilon: float = 0.25,
-        temp_threshold: int = 4,  #五子棋开局
+        temp_threshold: int = 60,  
         candidate_radius: int = 2,
         advantage_clip: float = 1.0,
         arena_win_threshold: float = 0.6,
@@ -80,7 +80,7 @@ class AlphaZeroConfig:
         policy_loss_weight: float = 1.0,
         value_loss_weight: float = 1.0,
         value_loss_delta: float = 0.5,
-        num_workers: int = 20,
+        num_workers: int = 16,      #拉满20个，有余地16个
         max_batch_size: int = 128,
         checkpoint_dir: str = "checkpoints/az_train",
         save_interval: int = 1,
@@ -383,7 +383,8 @@ def arena_worker_loop(
             request_queue.put((worker_id, model_id, state_np))
             try:
                 res = result_queue.get(timeout=30)
-                if isinstance(res, tuple) and res[0] == "FATAL_INIT":
+                # ★ 修复 FutureWarning: 增加长度判断，避免 numpy array 与 string 的比较
+                if isinstance(res, tuple) and len(res) == 3 and res[0] == "FATAL_INIT":
                     raise RuntimeError("竞技场推理服务器初始化失败")
                 policy, value = res
             except queue.Empty:
@@ -442,8 +443,6 @@ def arena_worker_loop(
                 else:
                     last_action_for_new = action
 
-                # 树复用：MCTS.search内部通过last_action推进了对手的落子，这里再推进当前玩家的落子
-                # 确保下一轮该模型再次落子时，root已经停留在当前局面
                 if current_mcts.root is not None and action in current_mcts.root.children:
                     child = current_mcts.root.children[action]
                     child.parent = None
@@ -663,7 +662,6 @@ class AlphaZeroTrainer:
         self._create_optimizer()
 
         loaded = False
-        # ★ 改进：严格区分续训、预训练加载和随机初始化
         if config.resume:
             loaded = self._load_checkpoint()
             if not loaded:
@@ -693,7 +691,6 @@ class AlphaZeroTrainer:
         ], lr=self.config.learning_rate)
 
     def _reset_optimizer(self):
-        # ★ 改进：Collapse回退时直接重建优化器，使用初始配置LR，由下一轮Train接管调度
         self._create_optimizer()
         logger.info(f"  权重已回退，优化器已重建（清除错位动量），LR重置为 {self.config.learning_rate:.2e}")
 
@@ -842,7 +839,6 @@ class AlphaZeroTrainer:
         }
 
     def _arena_phase(self, iteration: int) -> Tuple[bool, list, float]:
-        # ★ 改进：返回 win_rate 以便外部判断 collapse
         logger.info(f"  竞技场: 新模型 vs 最佳模型 ({self.config.arena_games} 局 ★并发)")
         
         new_model_path = os.path.join(self.config.checkpoint_dir, 'new_model_arena.pt')
@@ -1024,7 +1020,6 @@ class AlphaZeroTrainer:
             logger.error(f"基准评估执行失败(可忽略): {e}")
 
     def _atomic_save(self, state, path):
-        """★ 改进：原子化保存，防止保存一半断电导致检查点损坏"""
         temp_path = path + ".tmp"
         torch.save(state, temp_path)
         os.replace(temp_path, path)
@@ -1107,10 +1102,8 @@ class AlphaZeroTrainer:
             if self.current_phase < 3:
                 if len(self.replay_buffer) >= self.config.min_replay_size:
                     logger.info("[阶段3] 竞技场评估...")
-                    # ★ 改进：获取竞技场结果与胜率
                     is_best, arena_samples, arena_win_rate = self._arena_phase(iteration)
 
-                    # ★ 改进：先判断是否发生 collapse，防止崩溃模型的脏数据污染缓冲区
                     is_collapse = not is_best and arena_win_rate < self.config.arena_collapse_threshold
 
                     if is_collapse:
@@ -1119,7 +1112,6 @@ class AlphaZeroTrainer:
                         self.new_model.load_state_dict(self.best_model.state_dict())
                         self._reset_optimizer()
                     else:
-                        # 正常情况：将竞技场数据加入缓冲区
                         if self.config.arena_data_to_buffer and arena_samples:
                             a_states = np.array([s[0] for s in arena_samples], dtype=np.float32)
                             a_policies = np.array([s[1] for s in arena_samples], dtype=np.float32)
