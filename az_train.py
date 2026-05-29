@@ -1,7 +1,8 @@
 # az_train.py
 """
 五子棋 AlphaZero 训练主循环
-(改进版v9.5: 优势裁剪 + HuberLoss + Cosine LR/Warmup + 两阶段安全存档 + 竞技场/基准评估完美树复用 + 【竞技场双模型并发推理】)
+(改进版v9.6: 优势裁剪 + HuberLoss + Cosine LR/Warmup + 两阶段安全存档 + 竞技场/基准评估完美树复用 + 竞技场双模型并发推理
+ + 【修复】ReplayBuffer线性化错位 + 【修复】Collapse脏数据回退 + 【优化】续训/初始化逻辑 + 【优化】原子化存档)
 """
 
 import os
@@ -48,12 +49,12 @@ class AlphaZeroConfig:
         games_per_iteration: int = 200,
         train_steps_per_iteration: int = 80,
         baseline_eval_games: int = 40,
-        arena_games: int = 40,
+        arena_games: int = 50,
         num_sims: int = 400,
         c_puct: float = 2.5,
         dirichlet_alpha: float = 0.2,
         dirichlet_epsilon: float = 0.25,
-        temp_threshold: int = 8,
+        temp_threshold: int = 4,  #五子棋开局
         candidate_radius: int = 2,
         advantage_clip: float = 1.0,
         arena_win_threshold: float = 0.6,
@@ -62,7 +63,7 @@ class AlphaZeroConfig:
         arena_dirichlet_alpha: float = 0.2,
         arena_dirichlet_epsilon: float = 0.0,
         arena_temperature: float = 1e-3,
-        arena_temp_threshold: int = 8,
+        arena_temp_threshold: int = 4,  #五子棋开局
         arena_collapse_threshold: float = 0.35,
         arena_save_image_every_n_games: int = 5,
         arena_data_to_buffer: bool = True,
@@ -79,7 +80,7 @@ class AlphaZeroConfig:
         policy_loss_weight: float = 1.0,
         value_loss_weight: float = 1.0,
         value_loss_delta: float = 0.5,
-        num_workers: int = 16,
+        num_workers: int = 20,
         max_batch_size: int = 128,
         checkpoint_dir: str = "checkpoints/az_train",
         save_interval: int = 1,
@@ -103,7 +104,6 @@ class AlphaZeroConfig:
 
 
 class ReplayBuffer:
-    # ... (保持不变) ...
     def __init__(self, capacity: int):
         self.capacity = capacity
         self.states = np.zeros((capacity, 3, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
@@ -146,16 +146,23 @@ class ReplayBuffer:
 
     def get_linearized_data(self):
         if self.size == 0: return None, None, None, None
+        
+        # ★ 修复：缓冲区未回绕时(cursor <= capacity)，数据是从0开始连续存储的
+        if self.cursor <= self.capacity:
+            return (self.states[:self.size], self.policies[:self.size], 
+                    self.values[:self.size], self.advantages[:self.size])
+        
+        # 缓冲区已回绕
         start = self.cursor % self.capacity
-        if start + self.size <= self.capacity:
-            return (self.states[start:start+self.size], self.policies[start:start+self.size], 
-                    self.values[start:start+self.size], self.advantages[start:start+self.size])
+        if start == 0:  # 刚好整除，数据也是连续的
+            return (self.states[:self.capacity], self.policies[:self.capacity], 
+                    self.values[:self.capacity], self.advantages[:self.capacity])
         else:
             first = self.capacity - start
-            states = np.concatenate([self.states[start:], self.states[:self.size-first]], axis=0)
-            policies = np.concatenate([self.policies[start:], self.policies[:self.size-first]], axis=0)
-            values = np.concatenate([self.values[start:], self.values[:self.size-first]], axis=0)
-            advantages = np.concatenate([self.advantages[start:], self.advantages[:self.size-first]], axis=0)
+            states = np.concatenate([self.states[start:], self.states[:first]], axis=0)
+            policies = np.concatenate([self.policies[start:], self.policies[:first]], axis=0)
+            values = np.concatenate([self.values[start:], self.values[:first]], axis=0)
+            advantages = np.concatenate([self.advantages[start:], self.advantages[:first]], axis=0)
             return states, policies, values, advantages
 
     def restore_from_linearized(self, states, policies, values, cursor, advantages=None):
@@ -169,11 +176,11 @@ class ReplayBuffer:
         else:
             self.advantages[:n] = 1.0
         self.size = n
-        self.cursor = cursor % self.capacity
+        self.cursor = cursor
 
 
 # =====================================================================
-# ★ 新增：双模型并发推理服务器
+# 双模型并发推理服务器
 # =====================================================================
 class DualInferenceServer:
     def __init__(self, best_model_path: str, new_model_path: str, device_str: str, num_workers: int, max_batch_size: int = 32):
@@ -188,22 +195,23 @@ class DualInferenceServer:
         
         self.ready_event = mp.Event()
         self.shutdown_event = mp.Event()
+        self.init_error = mp.Value('b', False) # 记录是否初始化失败
         
         self.process = mp.Process(
             target=DualInferenceServer._server_loop_static, 
             args=(self.best_model_path, self.new_model_path, self.device_str, self.max_batch_size, 
                   self.num_workers, self.request_queue, self.result_queues, 
-                  self.shutdown_event, self.ready_event),
+                  self.shutdown_event, self.ready_event, self.init_error),
             daemon=True
         )
         self.process.start()
 
     @staticmethod
     def _server_loop_static(best_model_path, new_model_path, device_str, max_batch_size, num_workers,
-                            request_queue, result_queues, shutdown_event, ready_event):
+                            request_queue, result_queues, shutdown_event, ready_event, init_error):
         device = torch.device(device_str)
+        best_model, new_model = None, None
         try:
-            # 加载双模型
             best_ckpt = torch.load(best_model_path, map_location=device, weights_only=False)
             best_sd = best_ckpt.get('model_state_dict', best_ckpt)
             channels = best_sd['stem_conv.weight'].shape[0]
@@ -226,9 +234,13 @@ class DualInferenceServer:
             print(f"[DualInferenceServer] 双模型并发推理启动 (Max Batch: {max_batch_size})")
         except Exception as e:
             print(f"[DualInferenceServer] 模型加载失败: {e}")
-            for q in result_queues: q.put((None, None))
+            init_error.value = True
+            for q in result_queues: q.put(("FATAL_INIT", None, None))
         finally:
-            ready_event.set()
+            ready_event.set() # 无论成功失败都set，防止主进程死锁
+
+        if best_model is None or new_model is None:
+            return
 
         while not shutdown_event.is_set():
             batch_data = []
@@ -249,12 +261,9 @@ class DualInferenceServer:
                 continue
 
             try:
-                # ★ 核心改进：按 model_id 分组凑批
-                # 0: best_model, 1: new_model
                 best_items = [d for d in batch_data if d[1] == 0]
                 new_items = [d for d in batch_data if d[1] == 1]
                 
-                # 处理 Best Model 批次
                 if best_items:
                     wids_b = [d[0] for d in best_items]
                     states_np_b = np.stack([d[2] for d in best_items], axis=0)
@@ -266,7 +275,6 @@ class DualInferenceServer:
                     for i, wid in enumerate(wids_b):
                         result_queues[wid].put((p_np_b[i], v_np_b[i].item()))
 
-                # 处理 New Model 批次
                 if new_items:
                     wids_n = [d[0] for d in new_items]
                     states_np_n = np.stack([d[2] for d in new_items], axis=0)
@@ -370,13 +378,14 @@ def arena_worker_loop(
     worker_id, request_queue, result_queue, task_queue, output_queue, config
 ):
     """★ 竞技场并发 Worker (自带完美树复用)"""
-    # 绑定 model_id 的评估函数
     def make_eval_fn(model_id):
         def eval_fn(state_np):
-            # 格式: (worker_id, model_id, state_np)
             request_queue.put((worker_id, model_id, state_np))
             try:
-                policy, value = result_queue.get(timeout=30)
+                res = result_queue.get(timeout=30)
+                if isinstance(res, tuple) and res[0] == "FATAL_INIT":
+                    raise RuntimeError("竞技场推理服务器初始化失败")
+                policy, value = res
             except queue.Empty:
                 raise RuntimeError("竞技场推理服务器超时")
             if policy is None:
@@ -428,13 +437,13 @@ def arena_worker_loop(
                 )
                 game_data.append((state_to_tensor(state), mcts_policy, advantages, state.current_player))
 
-                # 追踪对手动作
                 if is_new_turn:
                     last_action_for_best = action
                 else:
                     last_action_for_new = action
 
-                # 手动推进当前MCTS的root，为两步后的复用做准备
+                # 树复用：MCTS.search内部通过last_action推进了对手的落子，这里再推进当前玩家的落子
+                # 确保下一轮该模型再次落子时，root已经停留在当前局面
                 if current_mcts.root is not None and action in current_mcts.root.children:
                     child = current_mcts.root.children[action]
                     child.parent = None
@@ -446,7 +455,6 @@ def arena_worker_loop(
                 winner = GomokuRules.check_winner(state)
                 if winner is not None: break
             
-            # 格式: (winner, new_is_black, game_data, history)
             output_queue.put((winner, new_is_black, game_data, list(state.history)))
             
         except Exception as e:
@@ -462,7 +470,7 @@ def baseline_eval_worker(
     candidate_radius, advantage_clip, arena_temperature,
     agent_depth, agent_max_candidates
 ):
-    """基准评估 Worker (单模型树复用)"""
+    """基准评估 Worker"""
     try:
         from agent_ad import Agent as AgentAD
     except ImportError:
@@ -548,7 +556,6 @@ def self_play_phase_parallel(
     model_path, device_str, num_games, temp_threshold, num_workers,
     max_batch_size, config, iteration_idx
 ):
-    # ... (与之前版本完全一致) ...
     logger.info(f"启动 GPU 推理服务器 (自弈模型: {os.path.basename(model_path)})...")
     server = InferenceServer(model_path, device_str, num_workers, max_batch_size)
     server.ready_event.wait()
@@ -656,12 +663,20 @@ class AlphaZeroTrainer:
         self._create_optimizer()
 
         loaded = False
+        # ★ 改进：严格区分续训、预训练加载和随机初始化
         if config.resume:
             loaded = self._load_checkpoint()
-            if not loaded: logger.warning("续训失败，将从头开始训练")
+            if not loaded:
+                logger.error("续训失败：未找到有效检查点！请确认检查点文件存在，或去掉 --resume 参数从头/预训练开始")
+                sys.exit(1)
+                
         if not loaded and config.initial_model:
-            self._load_initial_model(config.initial_model)
-            loaded = True
+            if os.path.exists(config.initial_model):
+                self._load_initial_model(config.initial_model)
+                loaded = True
+            else:
+                logger.warning(f"预训练模型 {config.initial_model} 不存在，跳过")
+                
         if not loaded:
             logger.info("从随机初始化开始训练")
             self.new_model.load_state_dict(self.best_model.state_dict())
@@ -678,11 +693,9 @@ class AlphaZeroTrainer:
         ], lr=self.config.learning_rate)
 
     def _reset_optimizer(self):
-        current_lr = self.optimizer.param_groups[0]['lr']
+        # ★ 改进：Collapse回退时直接重建优化器，使用初始配置LR，由下一轮Train接管调度
         self._create_optimizer()
-        for pg in self.optimizer.param_groups:
-            pg['lr'] = current_lr
-        logger.info(f"  权重已回退，优化器已重建（清除错位动量），学习率保持 {current_lr:.2e}")
+        logger.info(f"  权重已回退，优化器已重建（清除错位动量），LR重置为 {self.config.learning_rate:.2e}")
 
     def _get_lr(self, iteration: int) -> float:
         lr = self.config.learning_rate
@@ -707,7 +720,6 @@ class AlphaZeroTrainer:
         logger.info("✓ 预训练模型加载成功 (best_model + new_model 同步)")
 
     def _load_checkpoint(self) -> bool:
-        # ... (与之前修复版本一致) ...
         path = os.path.join(self.config.checkpoint_dir, 'latest_checkpoint.pt')
         if not os.path.exists(path):
             logger.info("未找到检查点文件")
@@ -756,7 +768,6 @@ class AlphaZeroTrainer:
         logger.info("=" * 70)
 
     def _train_step(self, states, policies, values, advantages):
-        # ... (与之前版本一致) ...
         self.new_model.train()
         B = states.shape[0]
         tids = np.random.randint(0, 8, size=B)
@@ -830,15 +841,14 @@ class AlphaZeroTrainer:
             'valid_steps': valid_steps,
         }
 
-    def _arena_phase(self, iteration: int) -> Tuple[bool, list]:
+    def _arena_phase(self, iteration: int) -> Tuple[bool, list, float]:
+        # ★ 改进：返回 win_rate 以便外部判断 collapse
         logger.info(f"  竞技场: 新模型 vs 最佳模型 ({self.config.arena_games} 局 ★并发)")
         
-        # ★ 保存 new_model 到磁盘，供 DualInferenceServer 加载
         new_model_path = os.path.join(self.config.checkpoint_dir, 'new_model_arena.pt')
         torch.save({'model_state_dict': self.new_model.state_dict()}, new_model_path)
         best_model_path = os.path.join(self.config.checkpoint_dir, 'best_model.pt')
         
-        # ★ 启动双模型并发推理服务器
         server = DualInferenceServer(
             best_model_path=best_model_path, 
             new_model_path=new_model_path, 
@@ -847,6 +857,13 @@ class AlphaZeroTrainer:
             max_batch_size=self.config.max_batch_size
         )
         server.ready_event.wait()
+        
+        if server.init_error.value:
+            logger.error("  双模型推理服务器初始化失败，跳过竞技场")
+            server.shutdown()
+            if os.path.exists(new_model_path): os.remove(new_model_path)
+            return False, [], 0.0
+            
         logger.info("  双模型推理服务器已就绪")
 
         task_queue = mp.Queue()
@@ -898,7 +915,6 @@ class AlphaZeroTrainer:
                 
             winner, new_is_black, game_data, history = result
             
-            # 统计胜负
             if winner == 0: 
                 draws += 1
             elif (winner == 1 and new_is_black) or (winner == 2 and not new_is_black): 
@@ -906,7 +922,6 @@ class AlphaZeroTrainer:
             else: 
                 best_wins += 1
                 
-            # 收集训练数据
             for s, p, adv, player in game_data:
                 value = 0.0 if winner == 0 else (1.0 if winner == player else -1.0)
                 all_arena_samples.append((s, p, value, adv))
@@ -926,23 +941,22 @@ class AlphaZeroTrainer:
             if p.is_alive(): p.terminate()
         server.shutdown()
         
-        # 清理临时文件
         if os.path.exists(new_model_path):
             os.remove(new_model_path)
 
         total = new_wins + best_wins + draws
         win_rate = new_wins / total if total > 0 else 0
         logger.info(f"  竞技场结果: 新模型 {new_wins}胜 / 最佳 {best_wins}胜 / 平 {draws} | 胜率 {win_rate:.1%}")
-        logger.info(f"  竞技场数据: 收集 {len(all_arena_samples)} 样本")
         
         self.iteration_stats.append({
             'type': 'arena', 'iteration': iteration,
             'new_wins': new_wins, 'best_wins': best_wins, 'draws': draws, 'win_rate': win_rate
         })
-        return win_rate >= self.config.arena_win_threshold, all_arena_samples
+        
+        is_best = win_rate >= self.config.arena_win_threshold
+        return is_best, all_arena_samples, win_rate
 
     def _evaluate_baseline(self, iteration: int):
-        # ... (与之前版本一致，使用 InferenceServer 单模型并发) ...
         try:
             from agent_ad import Agent as AgentAD
             logger.info(f"[基准评估] 最佳模型 vs 规则引擎 ({self.config.baseline_eval_games}局, 并行)...")
@@ -1009,6 +1023,12 @@ class AlphaZeroTrainer:
         except Exception as e:
             logger.error(f"基准评估执行失败(可忽略): {e}")
 
+    def _atomic_save(self, state, path):
+        """★ 改进：原子化保存，防止保存一半断电导致检查点损坏"""
+        temp_path = path + ".tmp"
+        torch.save(state, temp_path)
+        os.replace(temp_path, path)
+
     def _save_checkpoint(self, iteration, is_best=False, save_replay=False, phase=0):
         os.makedirs(self.config.checkpoint_dir, exist_ok=True)
         state = {
@@ -1022,8 +1042,8 @@ class AlphaZeroTrainer:
             'iteration_stats': self.iteration_stats,
             'current_phase': phase,
         }
-        torch.save(state, os.path.join(self.config.checkpoint_dir, 'latest_checkpoint.pt'))
-        torch.save({'model_state_dict': self.best_model.state_dict()}, 
+        self._atomic_save(state, os.path.join(self.config.checkpoint_dir, 'latest_checkpoint.pt'))
+        self._atomic_save({'model_state_dict': self.best_model.state_dict()}, 
                   os.path.join(self.config.checkpoint_dir, 'best_model.pt'))
         if save_replay: self._save_replay_buffer()
 
@@ -1087,35 +1107,36 @@ class AlphaZeroTrainer:
             if self.current_phase < 3:
                 if len(self.replay_buffer) >= self.config.min_replay_size:
                     logger.info("[阶段3] 竞技场评估...")
-                    is_best, arena_samples = self._arena_phase(iteration)
+                    # ★ 改进：获取竞技场结果与胜率
+                    is_best, arena_samples, arena_win_rate = self._arena_phase(iteration)
 
-                    if self.config.arena_data_to_buffer and arena_samples:
-                        a_states = np.array([s[0] for s in arena_samples], dtype=np.float32)
-                        a_policies = np.array([s[1] for s in arena_samples], dtype=np.float32)
-                        a_values = np.array([s[2] for s in arena_samples], dtype=np.float32)
-                        a_advantages = np.array([s[3] for s in arena_samples], dtype=np.float32)
-                        self.replay_buffer.add(a_states, a_policies, a_values, a_advantages)
-                        logger.info(f"  ✓ 竞技场数据已加入缓冲区: +{len(arena_samples)} 样本 | 缓冲区总计 {len(self.replay_buffer):,}")
+                    # ★ 改进：先判断是否发生 collapse，防止崩溃模型的脏数据污染缓冲区
+                    is_collapse = not is_best and arena_win_rate < self.config.arena_collapse_threshold
 
-                    arena_win_rate = 0.0
-                    for stat in reversed(self.iteration_stats):
-                        if stat.get('type') == 'arena' and stat.get('iteration') == iteration:
-                            arena_win_rate = stat.get('win_rate', 0.0)
-                            break
-
-                    if is_best:
-                        self.best_model.load_state_dict(self.new_model.state_dict())
-                        history_dir = os.path.join(self.config.checkpoint_dir, "history_best_models")
-                        os.makedirs(history_dir, exist_ok=True)
-                        history_best_path = os.path.join(history_dir, f'best_model_iter_{iteration+1}.pt')
-                        torch.save({'model_state_dict': self.best_model.state_dict()}, history_best_path)
-                        logger.info(f"  ★ 新模型胜出，已更新为最佳模型 (历史快照已保存: {os.path.basename(history_best_path)})")
-                    elif arena_win_rate < self.config.arena_collapse_threshold:
-                        logger.warning(f"  ⚠️ 竞技场胜率极低({arena_win_rate:.1%} < {self.config.arena_collapse_threshold:.0%})，紧急回退到最佳模型！")
+                    if is_collapse:
+                        logger.warning(f"  ⚠️ 竞技场胜率极低({arena_win_rate:.1%} < {self.config.arena_collapse_threshold:.0%})，"
+                                       "丢弃竞技场数据并紧急回退到最佳模型！")
                         self.new_model.load_state_dict(self.best_model.state_dict())
                         self._reset_optimizer()
                     else:
-                        logger.info(f"  新模型未胜出(胜率{arena_win_rate:.1%})，保留当前权重继续训练")
+                        # 正常情况：将竞技场数据加入缓冲区
+                        if self.config.arena_data_to_buffer and arena_samples:
+                            a_states = np.array([s[0] for s in arena_samples], dtype=np.float32)
+                            a_policies = np.array([s[1] for s in arena_samples], dtype=np.float32)
+                            a_values = np.array([s[2] for s in arena_samples], dtype=np.float32)
+                            a_advantages = np.array([s[3] for s in arena_samples], dtype=np.float32)
+                            self.replay_buffer.add(a_states, a_policies, a_values, a_advantages)
+                            logger.info(f"  ✓ 竞技场数据已加入缓冲区: +{len(arena_samples)} 样本 | 缓冲区总计 {len(self.replay_buffer):,}")
+
+                        if is_best:
+                            self.best_model.load_state_dict(self.new_model.state_dict())
+                            history_dir = os.path.join(self.config.checkpoint_dir, "history_best_models")
+                            os.makedirs(history_dir, exist_ok=True)
+                            history_best_path = os.path.join(history_dir, f'best_model_iter_{iteration+1}.pt')
+                            torch.save({'model_state_dict': self.best_model.state_dict()}, history_best_path)
+                            logger.info(f"  ★ 新模型胜出，已更新为最佳模型 (历史快照已保存: {os.path.basename(history_best_path)})")
+                        else:
+                            logger.info(f"  新模型未胜出(胜率{arena_win_rate:.1%})，保留当前权重继续训练")
                 else:
                     logger.info("  初期热身: 保持当前最佳模型, 缓冲区不足")
             else:

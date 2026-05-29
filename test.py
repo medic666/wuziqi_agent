@@ -68,7 +68,7 @@ def plot_policy_heatmap(policy_probs, my_pieces, opp_pieces, last_move, title):
 def main():
     parser = argparse.ArgumentParser()
     # 修改1：修复文件路径反斜杠转义问题，改用正斜杠
-    parser.add_argument('--model_path', type=str, default="checkpoints/joint_pretrain/best_model.pt")
+    parser.add_argument('--model_path', type=str, default="checkpoints/az_train/best_model.pt")
     args = parser.parse_args()
 
     # 实例化模型 (可根据实际训练的参数调整 num_res_blocks)
