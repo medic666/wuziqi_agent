@@ -28,9 +28,14 @@ stem+n个残差块+双头。
 
 ---
 ### pretrain_vs_agent.py
-还没运行过，不过用的都是pretrain和az_train的参数
+用的都是pretrain和az_train的参数。实践证明神经网络自对弈比较有效，很快就能对机械agent胜率100%了。这一步可以忽略
 
 ---
 ### 自对弈 az_train.py
 num_workers: int = 16, 算存之间的通道堵塞，cpu和gpu都吃不满，16个workers往gpu塞数据，效率比较折中。
 续训系统会在 checkpoints/az_train/ 目录下寻找 latest_checkpoint.pt 文件，replay_buffer.npz 文件，self_play_model.pt文件，best_model.pt文件，请全部保留
+
+---
+## 结论
+当前实际训练下来的问题就是，可能因为历史通道只有上一步的棋子。所以ai被调度后，大概率遗忘之前的威胁点。不过强势的地方是ai进攻很好，有一点学习到了机械agent的vct搜杀。限于计算机性能和时间，不能再往上提高ai水平了(可能的方向是增加历史通道，增加残差块数量，增加自对弈盘数)。不过当前的无禁手五子棋实验中，神经网络通过自对弈明显胜过了机械AI老师，并且价值网络判断黑棋的胜率为90%以上，包括竞技场的自对弈中也基本上是黑棋胜，已经证明了神经网络的学习能力。项目在此结案。
+实际游玩可以打开py human_vs_ai.py  --model "checkpoints/az_train/history_best_models/best_model_iter_59.pt"
