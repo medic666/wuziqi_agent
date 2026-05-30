@@ -219,3 +219,5 @@ __marimo__/
 checkpoints/az_train/game_images/
 checkpoints/az_train/arena_images/
 checkpoints/az_train/history_best_models/
+checkpoints/az_train/latest_checkpoint.pt
+checkpoints/az_train/replay_buffer.npz
