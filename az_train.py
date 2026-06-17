@@ -22,11 +22,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from gamerules import GameState, GomokuRules
-from network import ActorCriticNet
-from mcts import MCTS, state_to_tensor, create_local_eval_fn
-from inference_server import InferenceServer
-from utils import transform_2d, transform_state, save_board_image
+from core.gamerules import GameState, GomokuRules
+from agents.neural.network import ActorCriticNet
+from search.mcts import MCTS, state_to_tensor, create_local_eval_fn
+from training.inference_server import InferenceServer, DualInferenceServer
+from training.replay_buffer import ReplayBuffer
+from training.config import AlphaZeroConfig
+from utils.transforms import transform_2d, transform_state
+from utils.board_image import save_board_image
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,269 +40,6 @@ logger = logging.getLogger(__name__)
 
 BOARD_SIZE = GomokuRules.BOARD_SIZE
 BOARD_SQUARES = BOARD_SIZE * BOARD_SIZE
-
-
-class AlphaZeroConfig:
-    def __init__(
-        self,
-        num_res_blocks: int = 4,
-        channels: int = 128,
-        board_size: int = 15,
-        num_iterations: int = 200,
-        games_per_iteration: int = 200,
-        train_steps_per_iteration: int = 80,
-        baseline_eval_games: int = 40,
-        arena_games: int = 50,
-        num_sims: int = 400,
-        c_puct: float = 2.5,
-        dirichlet_alpha: float = 0.2,
-        dirichlet_epsilon: float = 0.25,
-        temp_threshold: int = 60,  
-        candidate_radius: int = 2,
-        advantage_clip: float = 1.0,
-        arena_win_threshold: float = 0.6,
-        arena_num_sims: int = 400,
-        arena_c_puct: float = 2.5,
-        arena_dirichlet_alpha: float = 0.2,
-        arena_dirichlet_epsilon: float = 0.0,
-        arena_temperature: float = 1e-3,
-        arena_temp_threshold: int = 4,  #五子棋开局
-        arena_collapse_threshold: float = 0.35,
-        arena_save_image_every_n_games: int = 5,
-        arena_data_to_buffer: bool = True,
-        baseline_num_sims: int = 400,
-        baseline_agent_depth: int = 4,
-        baseline_agent_max_candidates: int = 10,
-        replay_buffer_size: int = 500000,
-        min_replay_size: int = 5000,
-        batch_size: int = 128,
-        learning_rate: float = 1e-4,
-        lr_warmup_iterations: int = 5,
-        weight_decay: float = 1e-4,
-        grad_clip: float = 1.0,
-        policy_loss_weight: float = 1.0,
-        value_loss_weight: float = 1.0,
-        value_loss_delta: float = 0.5,
-        num_workers: int = 16,      #拉满20个，有余地16个
-        max_batch_size: int = 128,
-        checkpoint_dir: str = "checkpoints/az_train",
-        save_interval: int = 1,
-        save_replay_interval: int = 1,
-        save_image_every_n_games: int = 50,
-        device: str = "auto",
-        initial_model: Optional[str] = "checkpoints/joint_pretrain/best_model.pt",
-        resume: bool = False,
-    ):
-        for k, v in locals().items():
-            if k != 'self':
-                setattr(self, k, v)
-
-    def to_dict(self) -> dict:
-        return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
-
-    @classmethod
-    def from_dict(cls, d: dict):
-        valid_keys = cls().__dict__.keys()
-        return cls(**{k: v for k, v in d.items() if k in valid_keys})
-
-
-class ReplayBuffer:
-    def __init__(self, capacity: int):
-        self.capacity = capacity
-        self.states = np.zeros((capacity, 3, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
-        self.policies = np.zeros((capacity, BOARD_SQUARES), dtype=np.float32)
-        self.values = np.zeros(capacity, dtype=np.float32)
-        self.advantages = np.zeros((capacity, BOARD_SQUARES), dtype=np.float32)
-        self.size = 0
-        self.cursor = 0
-
-    def __len__(self):
-        return self.size
-
-    def add(self, states, policies, values, advantages):
-        n = len(states)
-        if n == 0: return
-        start = self.cursor % self.capacity
-        end = start + n
-        if end <= self.capacity:
-            self.states[start:end] = states
-            self.policies[start:end] = policies
-            self.values[start:end] = values
-            self.advantages[start:end] = advantages
-        else:
-            split = self.capacity - start
-            self.states[start:] = states[:split]
-            self.policies[start:] = policies[:split]
-            self.values[start:] = values[:split]
-            self.advantages[start:] = advantages[:split]
-            rest = n - split
-            self.states[:rest] = states[split:]
-            self.policies[:rest] = policies[split:]
-            self.values[:rest] = values[split:]
-            self.advantages[:rest] = advantages[split:]
-        self.cursor += n
-        self.size = min(self.cursor, self.capacity)
-
-    def sample(self, batch_size):
-        indices = np.random.randint(0, self.size, size=batch_size)
-        return self.states[indices], self.policies[indices], self.values[indices], self.advantages[indices]
-
-    def get_linearized_data(self):
-        if self.size == 0: return None, None, None, None
-        
-        # ★ 修复：缓冲区未回绕时(cursor <= capacity)，数据是从0开始连续存储的
-        if self.cursor <= self.capacity:
-            return (self.states[:self.size], self.policies[:self.size], 
-                    self.values[:self.size], self.advantages[:self.size])
-        
-        # 缓冲区已回绕
-        start = self.cursor % self.capacity
-        if start == 0:  # 刚好整除，数据也是连续的
-            return (self.states[:self.capacity], self.policies[:self.capacity], 
-                    self.values[:self.capacity], self.advantages[:self.capacity])
-        else:
-            first = self.capacity - start
-            states = np.concatenate([self.states[start:], self.states[:first]], axis=0)
-            policies = np.concatenate([self.policies[start:], self.policies[:first]], axis=0)
-            values = np.concatenate([self.values[start:], self.values[:first]], axis=0)
-            advantages = np.concatenate([self.advantages[start:], self.advantages[:first]], axis=0)
-            return states, policies, values, advantages
-
-    def restore_from_linearized(self, states, policies, values, cursor, advantages=None):
-        n = len(states)
-        if n > self.capacity: raise ValueError("数据超容量")
-        self.states[:n] = states
-        self.policies[:n] = policies
-        self.values[:n] = values
-        if advantages is not None and len(advantages) == n:
-            self.advantages[:n] = advantages
-        else:
-            self.advantages[:n] = 1.0
-        self.size = n
-        self.cursor = cursor
-
-
-# =====================================================================
-# 双模型并发推理服务器
-# =====================================================================
-class DualInferenceServer:
-    def __init__(self, best_model_path: str, new_model_path: str, device_str: str, num_workers: int, max_batch_size: int = 32):
-        self.best_model_path = best_model_path
-        self.new_model_path = new_model_path
-        self.device_str = device_str
-        self.max_batch_size = max_batch_size
-        self.num_workers = num_workers
-        
-        self.request_queue = mp.Queue()
-        self.result_queues = [mp.Queue() for _ in range(num_workers)]
-        
-        self.ready_event = mp.Event()
-        self.shutdown_event = mp.Event()
-        self.init_error = mp.Value('b', False) # 记录是否初始化失败
-        
-        self.process = mp.Process(
-            target=DualInferenceServer._server_loop_static, 
-            args=(self.best_model_path, self.new_model_path, self.device_str, self.max_batch_size, 
-                  self.num_workers, self.request_queue, self.result_queues, 
-                  self.shutdown_event, self.ready_event, self.init_error),
-            daemon=True
-        )
-        self.process.start()
-
-    @staticmethod
-    def _server_loop_static(best_model_path, new_model_path, device_str, max_batch_size, num_workers,
-                            request_queue, result_queues, shutdown_event, ready_event, init_error):
-        device = torch.device(device_str)
-        best_model, new_model = None, None
-        try:
-            best_ckpt = torch.load(best_model_path, map_location=device, weights_only=False)
-            best_sd = best_ckpt.get('model_state_dict', best_ckpt)
-            channels = best_sd['stem_conv.weight'].shape[0]
-            res_block_indices = [int(k.split('.')[1]) for k in best_sd if k.startswith('res_blocks.')]
-            num_blocks = max(res_block_indices) + 1 if res_block_indices else 4
-            
-            best_model = ActorCriticNet(num_res_blocks=num_blocks, channels=channels).to(device)
-            best_model.load_state_dict(best_sd)
-            best_model.eval()
-            
-            new_ckpt = torch.load(new_model_path, map_location=device, weights_only=False)
-            new_sd = new_ckpt.get('model_state_dict', new_ckpt)
-            new_model = ActorCriticNet(num_res_blocks=num_blocks, channels=channels).to(device)
-            new_model.load_state_dict(new_sd)
-            new_model.eval()
-            
-            if device.type == 'cuda':
-                torch.backends.cudnn.benchmark = True
-                
-            print(f"[DualInferenceServer] 双模型并发推理启动 (Max Batch: {max_batch_size})")
-        except Exception as e:
-            print(f"[DualInferenceServer] 模型加载失败: {e}")
-            init_error.value = True
-            for q in result_queues: q.put(("FATAL_INIT", None, None))
-        finally:
-            ready_event.set() # 无论成功失败都set，防止主进程死锁
-
-        if best_model is None or new_model is None:
-            return
-
-        while not shutdown_event.is_set():
-            batch_data = []
-            try:
-                item = request_queue.get(timeout=0.1) 
-                batch_data.append(item)
-                
-                while len(batch_data) < max_batch_size:
-                    try:
-                        item = request_queue.get_nowait()
-                        batch_data.append(item)
-                    except queue.Empty:
-                        break
-            except queue.Empty:
-                continue
-
-            if not batch_data:
-                continue
-
-            try:
-                best_items = [d for d in batch_data if d[1] == 0]
-                new_items = [d for d in batch_data if d[1] == 1]
-                
-                if best_items:
-                    wids_b = [d[0] for d in best_items]
-                    states_np_b = np.stack([d[2] for d in best_items], axis=0)
-                    states_t_b = torch.from_numpy(states_np_b).to(device)
-                    with torch.no_grad():
-                        p_t_b, v_t_b = best_model(states_t_b)
-                        p_np_b = torch.softmax(p_t_b.view(states_t_b.size(0), -1), dim=1).cpu().numpy()
-                        v_np_b = v_t_b.view(-1).cpu().numpy()
-                    for i, wid in enumerate(wids_b):
-                        result_queues[wid].put((p_np_b[i], v_np_b[i].item()))
-
-                if new_items:
-                    wids_n = [d[0] for d in new_items]
-                    states_np_n = np.stack([d[2] for d in new_items], axis=0)
-                    states_t_n = torch.from_numpy(states_np_n).to(device)
-                    with torch.no_grad():
-                        p_t_n, v_t_n = new_model(states_t_n)
-                        p_np_n = torch.softmax(p_t_n.view(states_t_n.size(0), -1), dim=1).cpu().numpy()
-                        v_np_n = v_t_n.view(-1).cpu().numpy()
-                    for i, wid in enumerate(wids_n):
-                        result_queues[wid].put((p_np_n[i], v_np_n[i].item()))
-                        
-            except Exception as e:
-                print(f"\n[DualInferenceServer] 推理出错: {e}")
-                for d in batch_data:
-                    result_queues[d[0]].put((None, None))
-
-    def get_queues(self, worker_id: int):
-        return self.request_queue, self.result_queues[worker_id]
-
-    def shutdown(self):
-        self.shutdown_event.set()
-        self.process.join(timeout=5.0)
-        if self.process.is_alive():
-            self.process.terminate()
-            self.process.join()
 
 
 # =====================================================================
@@ -471,7 +211,7 @@ def baseline_eval_worker(
 ):
     """基准评估 Worker"""
     try:
-        from agent_ad import Agent as AgentAD
+        from agents.rule_based import ADAgent as AgentAD
     except ImportError:
         output_queue.put(("FATAL", worker_id, "ImportError"))
         return
@@ -954,7 +694,7 @@ class AlphaZeroTrainer:
 
     def _evaluate_baseline(self, iteration: int):
         try:
-            from agent_ad import Agent as AgentAD
+            from agents.rule_based import ADAgent as AgentAD
             logger.info(f"[基准评估] 最佳模型 vs 规则引擎 ({self.config.baseline_eval_games}局, 并行)...")
             best_model_path = os.path.join(self.config.checkpoint_dir, 'best_model.pt')
             if not os.path.exists(best_model_path):

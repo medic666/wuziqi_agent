@@ -26,148 +26,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from gamerules import GameState, GomokuRules
-from network import ActorCriticNet
-from mcts import MCTS, state_to_tensor
-from inference_server import InferenceServer
-from agent_ad import Agent as AgentAD
-from utils import transform_2d, transform_state, save_board_image
+from core.gamerules import GameState, GomokuRules
+from agents.neural.network import ActorCriticNet
+from search.mcts import MCTS, state_to_tensor
+from training.inference_server import InferenceServer
+from training.replay_buffer import ReplayBuffer
+from training.config import PretrainConfig
+from agents.rule_based import ADAgent as AgentAD
+from utils.transforms import transform_2d, transform_state
+from utils.board_image import save_board_image
+from utils.zobrist import compute_zobrist_fingerprint, save_trans_table, load_trans_table
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger(__name__)
 
 BOARD_SIZE = GomokuRules.BOARD_SIZE
 BOARD_SQUARES = BOARD_SIZE * BOARD_SIZE
-
-
-# ═══════════════════════ 配置 ═══════════════════════
-
-@dataclass
-class PretrainConfig:
-    # 网络
-    num_res_blocks: int = 4
-    channels: int = 128
-    board_size: int = 15
-
-    # 预训练轮次
-    num_iterations: int = 50
-    games_per_iteration: int = 100
-
-    # MCTS
-    num_sims: int = 400
-    c_puct: float = 1.5
-    dirichlet_alpha: float = 0.2
-    dirichlet_epsilon: float = 0 #关掉噪声因为对手agent比较随机
-    temp_threshold: int = 6
-    candidate_radius: int = 3
-    advantage_clip: float = 1.0
-
-    # AgentAD 对手
-    agent_depth: int = 4
-    agent_max_candidates: int = 10
-    agent_use_quiescence: bool = True
-    agent_vct_depth: int = 8
-
-    # 训练
-    replay_buffer_size: int = 500000
-    min_replay_size: int = 5000
-    batch_size: int = 128
-    train_steps_per_iteration: int = 40
-    learning_rate: float = 1e-4
-    lr_warmup_iterations: int = 3
-    weight_decay: float = 1e-4
-    grad_clip: float = 1.0
-    value_loss_delta: float = 0.5
-
-    # 早停 (仅早停，无回退)
-    early_stop_patience: int = 15
-    early_stop_min_delta: float = 0.02
-
-    # 多进程
-    num_workers: int = 16
-    max_batch_size: int = 128
-
-    # 存档
-    checkpoint_dir: str = "checkpoints/pretrain_vs_agent"
-    initial_model: Optional[str] = "checkpoints/pretrain_vs_agent/best_model_old.pt"
-
-    # 图片保存配置
-    save_images: bool = True
-    save_image_every_n_games: int = 10
-
-    # 置换表
-    tt_save_interval: int = 10
-    tt_inherit_from_worker0: bool = True
-
-    def to_dict(self) -> dict:
-        return {k: v for k, v in self.__dict__.items()}
-
-    @classmethod
-    def from_dict(cls, d: dict):
-        valid_keys = cls().__dict__.keys()
-        return cls(**{k: v for k, v in d.items() if k in valid_keys})
-
-
-# ═══════════════════════ 回放缓冲区 ═══════════════════════
-
-class ReplayBuffer:
-    def __init__(self, capacity: int):
-        self.capacity = capacity
-        self.states = np.zeros((capacity, 3, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
-        self.policies = np.zeros((capacity, BOARD_SQUARES), dtype=np.float32)
-        self.values = np.zeros(capacity, dtype=np.float32)
-        self.advantages = np.zeros((capacity, BOARD_SQUARES), dtype=np.float32)
-        self.size = 0
-        self.cursor = 0
-
-    def __len__(self):
-        return self.size
-
-    def add(self, states, policies, values, advantages):
-        n = len(states)
-        if n == 0: return
-        start = self.cursor % self.capacity
-        end = start + n
-        if end <= self.capacity:
-            self.states[start:end] = states
-            self.policies[start:end] = policies
-            self.values[start:end] = values
-            self.advantages[start:end] = advantages
-        else:
-            split = self.capacity - start
-            self.states[start:] = states[:split]; self.policies[start:] = policies[:split]
-            self.values[start:] = values[:split]; self.advantages[start:] = advantages[:split]
-            rest = n - split
-            self.states[:rest] = states[split:]; self.policies[:rest] = policies[split:]
-            self.values[:rest] = values[split:]; self.advantages[:rest] = advantages[split:]
-        self.cursor += n
-        self.size = min(self.cursor, self.capacity)
-
-    def sample(self, batch_size):
-        indices = np.random.randint(0, self.size, size=batch_size)
-        return (self.states[indices], self.policies[indices],
-                self.values[indices], self.advantages[indices])
-
-    def get_linearized_data(self):
-        if self.size == 0: return None, None, None, None
-        start = self.cursor % self.capacity
-        if start + self.size <= self.capacity:
-            return (self.states[start:start+self.size], self.policies[start:start+self.size],
-                    self.values[start:start+self.size], self.advantages[start:start+self.size])
-        first = self.capacity - start
-        s = np.concatenate([self.states[start:], self.states[:self.size-first]], axis=0)
-        p = np.concatenate([self.policies[start:], self.policies[:self.size-first]], axis=0)
-        v = np.concatenate([self.values[start:], self.values[:self.size-first]], axis=0)
-        a = np.concatenate([self.advantages[start:], self.advantages[:self.size-first]], axis=0)
-        return s, p, v, a
-
-    def restore_from_linearized(self, states, policies, values, cursor, advantages=None):
-        n = len(states)
-        if n > self.capacity: raise ValueError("数据超容量")
-        self.states[:n] = states; self.policies[:n] = policies; self.values[:n] = values
-        if advantages is not None and len(advantages) == n: self.advantages[:n] = advantages
-        else: self.advantages[:n] = 1.0
-        self.size = n; self.cursor = cursor % self.capacity
 
 
 # ═══════════════════════ 置换表持久化 ═══════════════════════

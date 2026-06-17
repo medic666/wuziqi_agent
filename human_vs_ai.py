@@ -25,8 +25,8 @@ import threading
 import argparse
 from typing import Optional, Tuple, List
 
-from gamerules import GameState, GomokuRules
-from agent_az import AZAgent
+from core.gamerules import GameState, GomokuRules
+from agents.neural.az_agent import AZAgent
 
 
 class HumanVsAIArena:

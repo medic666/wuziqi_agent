@@ -1,0 +1,235 @@
+# training/config.py
+"""
+训练配置类（集中管理）
+
+所有训练入口脚本的配置集中于此，避免散落各处。
+每个配置类独立，不互相依赖，可由各自入口脚本按需导入。
+
+合并来源:
+  - AlphaZeroConfig: az_train.py L42-104
+  - PretrainConfig: pretrain_vs_agent.py L45-108
+  - TrainConfig: pre_train.py L30-75
+"""
+
+from typing import Optional
+from dataclasses import dataclass
+
+
+# ═══════════════════════════════════════════════════════════════
+#  AlphaZero 训练配置 (az_train.py)
+# ═══════════════════════════════════════════════════════════════
+
+class AlphaZeroConfig:
+    """
+    AlphaZero 自我对弈强化学习训练配置。
+    
+    包含自对弈、竞技场、基准评估、神经网络训练的全部参数。
+    
+    使用示例:
+        config = AlphaZeroConfig(num_iterations=200, games_per_iteration=200)
+        trainer = AlphaZeroTrainer(config)
+    """
+    def __init__(
+        self,
+        # ── 网络架构 ──
+        num_res_blocks: int = 4,
+        channels: int = 128,
+        board_size: int = 15,
+        # ── 训练循环 ──
+        num_iterations: int = 200,              # 总迭代次数
+        games_per_iteration: int = 200,          # 每轮自对弈局数
+        train_steps_per_iteration: int = 80,     # 每轮训练步数
+        baseline_eval_games: int = 40,           # 基准评估局数
+        arena_games: int = 50,                   # 竞技场局数
+        # ── MCTS 自对弈参数 ──
+        num_sims: int = 400,                     # MCTS 模拟次数
+        c_puct: float = 2.5,                     # PUCT 探索常数
+        dirichlet_alpha: float = 0.2,            # Dirichlet 噪声 alpha
+        dirichlet_epsilon: float = 0.25,         # Dirichlet 噪声混合比例
+        temp_threshold: int = 60,                # 温度阈值（步数）
+        candidate_radius: int = 2,               # 候选着法半径
+        advantage_clip: float = 1.0,             # 优势裁剪范围
+        # ── 竞技场参数 ──
+        arena_win_threshold: float = 0.6,        # 模型更新阈值
+        arena_num_sims: int = 400,               # 竞技场 MCTS 模拟次数
+        arena_c_puct: float = 2.5,               # 竞技场 PUCT
+        arena_dirichlet_alpha: float = 0.2,      # 竞技场 Dirichlet alpha
+        arena_dirichlet_epsilon: float = 0.0,    # 竞技场 Dirichlet 噪声（通常关）
+        arena_temperature: float = 1e-3,         # 竞技场温度（接近确定性）
+        arena_temp_threshold: int = 4,           # 竞技场温度阈值
+        arena_collapse_threshold: float = 0.35,  # 坍塌检测阈值
+        arena_save_image_every_n_games: int = 5, # 竞技场图片保存间隔
+        arena_data_to_buffer: bool = True,       # 竞技场数据是否加入缓冲区
+        # ── 基准评估参数 ──
+        baseline_num_sims: int = 400,            # 基准评估 MCTS 模拟次数
+        baseline_agent_depth: int = 4,           # 基准 Agent 搜索深度
+        baseline_agent_max_candidates: int = 10, # 基准 Agent 候选数
+        # ── 训练参数 ──
+        replay_buffer_size: int = 500000,        # 回放缓冲区容量
+        min_replay_size: int = 5000,             # 最小训练样本数
+        batch_size: int = 128,                   # 批次大小
+        learning_rate: float = 1e-4,             # 学习率
+        lr_warmup_iterations: int = 5,           # LR 预热迭代数
+        weight_decay: float = 1e-4,              # 权重衰减
+        grad_clip: float = 1.0,                  # 梯度裁剪
+        policy_loss_weight: float = 1.0,         # 策略损失权重
+        value_loss_weight: float = 1.0,          # 价值损失权重
+        value_loss_delta: float = 0.5,           # HuberLoss delta
+        # ── 并行参数 ──
+        num_workers: int = 16,                   # Worker 数
+        max_batch_size: int = 128,               # 最大批大小
+        # ── 存档参数 ──
+        checkpoint_dir: str = "checkpoints/az_train",
+        save_interval: int = 1,                  # 存档间隔（迭代）
+        save_replay_interval: int = 1,           # 回放缓冲区存档间隔
+        save_image_every_n_games: int = 50,      # 图片保存间隔
+        # ── 设备 ──
+        device: str = "auto",
+        initial_model: Optional[str] = "checkpoints/joint_pretrain/best_model.pt",
+        resume: bool = False,
+    ):
+        # 将全部参数设置为实例属性
+        for k, v in locals().items():
+            if k != 'self':
+                setattr(self, k, v)
+
+    def to_dict(self) -> dict:
+        """导出为字典（用于存档）。"""
+        return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
+
+    @classmethod
+    def from_dict(cls, d: dict):
+        """从字典恢复配置。"""
+        valid_keys = cls().__dict__.keys()
+        return cls(**{k: v for k, v in d.items() if k in valid_keys})
+
+
+# ═══════════════════════════════════════════════════════════════
+#  预训练 vs Agent 配置 (pretrain_vs_agent.py)
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class PretrainConfig:
+    """
+    预训练配置：神经网络 vs 规则引擎 (AgentAD) 对弈。
+    
+    对弈即评估，胜率驱动早停，逻辑极简。
+    """
+    # ── 网络架构 ──
+    num_res_blocks: int = 4
+    channels: int = 128
+    board_size: int = 15
+
+    # ── 预训练轮次 ──
+    num_iterations: int = 50
+    games_per_iteration: int = 100
+
+    # ── MCTS 参数 ──
+    num_sims: int = 400
+    c_puct: float = 1.5
+    dirichlet_alpha: float = 0.2
+    dirichlet_epsilon: float = 0        # 关掉噪声，因为对手 agent 比较随机
+    temp_threshold: int = 6
+    candidate_radius: int = 3
+    advantage_clip: float = 1.0
+
+    # ── AgentAD 对手参数 ──
+    agent_depth: int = 4
+    agent_max_candidates: int = 10
+    agent_use_quiescence: bool = True
+    agent_vct_depth: int = 8
+
+    # ── 训练参数 ──
+    replay_buffer_size: int = 500000
+    min_replay_size: int = 5000
+    batch_size: int = 128
+    train_steps_per_iteration: int = 40
+    learning_rate: float = 1e-4
+    lr_warmup_iterations: int = 3
+    weight_decay: float = 1e-4
+    grad_clip: float = 1.0
+    value_loss_delta: float = 0.5
+
+    # ── 早停参数 ──
+    early_stop_patience: int = 15
+    early_stop_min_delta: float = 0.02
+
+    # ── 并行参数 ──
+    num_workers: int = 16
+    max_batch_size: int = 128
+
+    # ── 存档参数 ──
+    checkpoint_dir: str = "checkpoints/pretrain_vs_agent"
+    initial_model: Optional[str] = "checkpoints/pretrain_vs_agent/best_model_old.pt"
+
+    # ── 图片保存 ──
+    save_images: bool = True
+    save_image_every_n_games: int = 10
+
+    # ── 置换表参数 ──
+    tt_save_interval: int = 10
+    tt_inherit_from_worker0: bool = True
+
+    def to_dict(self) -> dict:
+        return {k: v for k, v in self.__dict__.items()}
+
+    @classmethod
+    def from_dict(cls, d: dict):
+        valid_keys = cls().__dict__.keys()
+        return cls(**{k: v for k, v in d.items() if k in valid_keys})
+
+
+# ═══════════════════════════════════════════════════════════════
+#  预训练配置 (pre_train.py) — 从数据学习
+# ═══════════════════════════════════════════════════════════════
+
+class TrainConfig:
+    """
+    联合预训练配置：从收集的数据集中学习策略和价值。
+    
+    使用 Behavior Cloning + Value Regression，
+    从 data_collector.py 产出的数据中学习。
+    """
+    def __init__(
+        self,
+        data_path: str = "collected_data/training_data.npz",
+        val_ratio: float = 0.1,                  # 验证集比例
+        max_samples: int = 0,                    # 最大样本数（0=全部）
+        # ── 网络架构 ──
+        num_res_blocks: int = 4,
+        channels: int = 128,
+        board_size: int = 15,
+        # ── 训练参数 ──
+        batch_size: int = 128,
+        max_epochs: int = 50,
+        learning_rate: float = 1e-4,
+        weight_decay: float = 1e-4,
+        actor_loss_weight: float = 1.0,          # 策略损失权重
+        critic_loss_weight: float = 1.0,         # 价值损失权重
+        loss_type: str = "huber",                # 损失类型: "huber" or "mse"
+        grad_clip: float = 1.0,
+        scheduler_type: str = "cosine",          # 学习率调度: "cosine" or "plateau"
+        warmup_epochs: int = 5,
+        patience: int = 15,                      # 早停耐心
+        min_delta: float = 1e-5,                # 早停最小改善
+        checkpoint_dir: str = "checkpoints/joint_pretrain",
+        save_interval: int = 5,
+        device: str = "auto",
+        num_workers: int = 8,                    # DataLoader worker数
+        pin_memory: bool = True,
+        resume: bool = False,
+        resume_path: Optional[str] = None,
+        load_weights: Optional[str] = None,      # 仅加载权重
+    ):
+        # 将全部参数设置为实例属性
+        for k, v in locals().items():
+            if k != 'self':
+                setattr(self, k, v)
+
+    def to_dict(self) -> dict:
+        return self.__dict__.copy()
+
+    @classmethod
+    def from_dict(cls, d: dict):
+        valid_keys = cls().__dict__.keys()
+        return cls(**{k: v for k, v in d.items() if k in valid_keys})

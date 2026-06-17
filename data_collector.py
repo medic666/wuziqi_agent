@@ -25,7 +25,9 @@ import hashlib
 import json
 import argparse
 
-from utils import transform_2d, transform_state, save_board_image
+from utils.transforms import transform_2d, transform_state
+from utils.board_image import save_board_image
+from utils.zobrist import compute_zobrist_fingerprint, save_trans_table, load_trans_table
 
 
 # ╔════════════════════════════════════════════════════════════════════╗
@@ -130,48 +132,39 @@ def worker_init(counter, data_dir, depth, vct_depth):
         _worker_id = counter.value
         counter.value += 1
 
-    from agent_ad import Agent as ADAgent
-    from gamerules import GameState, GomokuRules
+    from agents.rule_based import ADAgent
+    from core.gamerules import GameState, GomokuRules
 
     # ★ depth/vct_depth: 来自 CLI 覆盖后的值 (通过 initargs 传入)
     # ★ MAX_CANDIDATES/USE_QUIESCENCE/QUIESCENCE_DEPTH: 来自配置区模块全局变量
     _agent1 = ADAgent(depth=depth, max_candidates=MAX_CANDIDATES,
-                      use_quiescence=USE_QUIESCENCE,
-                      quiescence_depth=QUIESCENCE_DEPTH,
-                      vct_depth=vct_depth, name="ADAgent1")
+                       use_quiescence=USE_QUIESCENCE,
+                       quiescence_depth=QUIESCENCE_DEPTH,
+                       vct_depth=vct_depth, name="ADAgent1")
     _agent2 = ADAgent(depth=depth, max_candidates=MAX_CANDIDATES,
-                      use_quiescence=USE_QUIESCENCE,
-                      quiescence_depth=QUIESCENCE_DEPTH,
-                      vct_depth=vct_depth, name="ADAgent2")
+                       use_quiescence=USE_QUIESCENCE,
+                       quiescence_depth=QUIESCENCE_DEPTH,
+                       vct_depth=vct_depth, name="ADAgent2")
     _rules_cls = GomokuRules
     _gamestate_cls = GameState
 
-    _zobrist_fingerprint = _compute_zobrist_fingerprint(_agent1)
+    _zobrist_fingerprint = compute_zobrist_fingerprint(_agent1.ZOBRIST_TABLE)
 
     os.makedirs(os.path.join(_data_dir, "trans_tables"), exist_ok=True)
     tt_path = os.path.join(_data_dir, "trans_tables", f"tt_worker_{_worker_id}.pkl")
     loaded = False
 
     if os.path.exists(tt_path):
-        loaded = _load_trans_table(tt_path, _zobrist_fingerprint)
+        loaded = _load_trans_table_local(tt_path, _zobrist_fingerprint)
 
     if not loaded and _worker_id > 0:
         tt_path_0 = os.path.join(_data_dir, "trans_tables", "tt_worker_0.pkl")
         if os.path.exists(tt_path_0):
-            _load_trans_table(tt_path_0, _zobrist_fingerprint, source="Worker_0继承")
+            _load_trans_table_local(tt_path_0, _zobrist_fingerprint, source="Worker_0继承")
 
 
-def _compute_zobrist_fingerprint(agent):
-    import struct
-    data = b''
-    for row in agent.ZOBRIST_TABLE:
-        for col in row:
-            for val in col:
-                data += struct.pack('Q', val)
-    return hashlib.md5(data).hexdigest()
-
-
-def _load_trans_table(tt_path, expected_fingerprint, source=None):
+def _load_trans_table_local(tt_path, expected_fingerprint, source=None):
+    """本地置换表加载（兼容 data_collector 的多格式：black/white 分表）"""
     global _agent1, _agent2
     import pickle
     try:
@@ -209,7 +202,7 @@ def _save_my_trans_table():
     tt_path = os.path.join(_data_dir, "trans_tables", f"tt_worker_{_worker_id}.pkl")
 
     tt_data = {
-        'zobrist_fingerprint': _compute_zobrist_fingerprint(_agent1),
+        'zobrist_fingerprint': compute_zobrist_fingerprint(_agent1.ZOBRIST_TABLE),
         'black': dict(_agent1.trans_table),
         'white': dict(_agent2.trans_table),
     }

@@ -12,7 +12,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib as mpl
-from network import ActorCriticNet
+from agents.neural.network import ActorCriticNet
 
 # ====== 全局设置中文字体防乱码 ======
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'PingFang SC', 'sans-serif']

@@ -21,58 +21,17 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm  # 导入进度条库
 
-from network import ActorCriticNet
-from utils import transform_state, transform_2d  # 引入8向变换工具
+from agents.neural.network import ActorCriticNet
+from utils.transforms import transform_state, transform_2d  # 引入8向变换工具
+from training.config import TrainConfig
+
+# 兼容旧代码：直接从本模块导入 TrainConfig
+# (已在 training/config.py 中定义，此处导入后本文件内可直接使用)
 
 # =====================================================================
-#  配置
+#  配置 (已移至 training/config.py，此处保留别名兼容)
 # =====================================================================
-class TrainConfig:
-    def __init__(
-        self,
-        data_path: str = "collected_data/training_data.npz",
-        val_ratio: float = 0.1,
-        max_samples: int = 0,
-        num_res_blocks: int = 4,
-        channels: int = 128,
-        board_size: int = 15,
-        batch_size: int = 128,
-        max_epochs: int = 50,
-        learning_rate: float = 1e-4,
-        weight_decay: float = 1e-4,
-        actor_loss_weight: float = 1.0,
-        critic_loss_weight: float = 1.0,
-        loss_type: str = "huber",
-        grad_clip: float = 1.0,
-        scheduler_type: str = "cosine",
-        warmup_epochs: int = 5,
-        patience: int = 15,
-        min_delta: float = 1e-5,
-        checkpoint_dir: str = "checkpoints/joint_pretrain",
-        save_interval: int = 5,
-        device: str = "auto",
-        num_workers: int = 8,
-        pin_memory: bool = True,
-        resume: bool = False,
-        resume_path: Optional[str] = None,
-        load_weights: Optional[str] = None,
-    ):
-        self.data_path = data_path; self.val_ratio = val_ratio; self.max_samples = max_samples
-        self.num_res_blocks = num_res_blocks; self.channels = channels; self.board_size = board_size
-        self.batch_size = batch_size; self.max_epochs = max_epochs; self.learning_rate = learning_rate
-        self.weight_decay = weight_decay; self.actor_loss_weight = actor_loss_weight
-        self.critic_loss_weight = critic_loss_weight; self.loss_type = loss_type
-        self.grad_clip = grad_clip; self.scheduler_type = scheduler_type; self.warmup_epochs = warmup_epochs
-        self.patience = patience; self.min_delta = min_delta; self.checkpoint_dir = checkpoint_dir
-        self.save_interval = save_interval; self.device = device; self.num_workers = num_workers
-        self.pin_memory = pin_memory; self.resume = resume; self.resume_path = resume_path
-        self.load_weights = load_weights
-
-    def to_dict(self) -> dict: return self.__dict__.copy()
-    @classmethod
-    def from_dict(cls, d: dict):
-        valid_keys = cls().__dict__.keys()
-        return cls(**{k: v for k, v in d.items() if k in valid_keys})
+# TrainConfig 从 training.config 导入，保持向后兼容
 
 # =====================================================================
 #  数据集 (支持8向动态增强)
