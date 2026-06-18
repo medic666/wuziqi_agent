@@ -180,6 +180,111 @@ class PretrainConfig:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  Transformer 训练配置 (transformer_train.py)
+# ═══════════════════════════════════════════════════════════════
+
+class TransformerConfig:
+    """
+    GoBangTransformer_v2 AlphaZero 自对弈强化学习训练配置。
+
+    与 AlphaZeroConfig 共享大部分 MCTS/竞技场/训练参数，
+    仅在网络架构参数上不同（Transformer vs CNN）。
+
+    使用示例:
+        config = TransformerConfig(num_iterations=200, games_per_iteration=200)
+        trainer = TransformerTrainer(config)
+    """
+    def __init__(
+        self,
+        # ── Transformer 网络架构 ──
+        d_model: int = 64,
+        num_heads: int = 4,
+        num_layers: int = 5,
+        ff_expand: int = 4,
+        dropout: float = 0.1,
+        board_size: int = 15,
+        # ── 训练循环 ──
+        num_iterations: int = 200,              # 总迭代次数
+        games_per_iteration: int = 200,          # 每轮自对弈局数
+        train_steps_per_iteration: int = 80,     # 每轮训练步数
+        baseline_eval_games: int = 40,           # 基准评估局数
+        arena_games: int = 50,                   # 竞技场局数
+        # ── MCTS 自对弈参数 ──
+        num_sims: int = 400,                     # MCTS 模拟次数
+        c_puct: float = 2.5,                     # PUCT 探索常数
+        dirichlet_alpha: float = 0.2,            # Dirichlet 噪声 alpha
+        dirichlet_epsilon: float = 0.25,         # Dirichlet 噪声混合比例
+        temp_threshold: int = 60,                # 温度阈值（步数）
+        candidate_radius: int = 2,               # 候选着法半径
+        advantage_clip: float = 1.0,             # 优势裁剪范围
+        # ── 竞技场参数 ──
+        arena_win_threshold: float = 0.6,        # 模型更新阈值
+        arena_num_sims: int = 400,               # 竞技场 MCTS 模拟次数
+        arena_c_puct: float = 2.5,               # 竞技场 PUCT
+        arena_dirichlet_alpha: float = 0.2,      # 竞技场 Dirichlet alpha
+        arena_dirichlet_epsilon: float = 0.0,    # 竞技场 Dirichlet 噪声（通常关）
+        arena_temperature: float = 1e-3,         # 竞技场温度（接近确定性）
+        arena_temp_threshold: int = 4,           # 竞技场温度阈值
+        arena_collapse_threshold: float = 0.35,  # 坍塌检测阈值
+        arena_save_image_every_n_games: int = 5, # 竞技场图片保存间隔
+        arena_data_to_buffer: bool = True,       # 竞技场数据是否加入缓冲区
+        # ── 基准评估参数 ──
+        baseline_num_sims: int = 400,            # 基准评估 MCTS 模拟次数
+        baseline_agent_depth: int = 4,           # 基准 Agent 搜索深度
+        baseline_agent_max_candidates: int = 10, # 基准 Agent 候选数
+        # ── 训练参数 ──
+        replay_buffer_size: int = 500000,        # 回放缓冲区容量
+        min_replay_size: int = 5000,             # 最小训练样本数
+        batch_size: int = 128,                   # 批次大小
+        learning_rate: float = 1e-4,             # 学习率
+        lr_warmup_iterations: int = 5,           # LR 预热迭代数
+        weight_decay: float = 1e-4,              # 权重衰减
+        grad_clip: float = 1.0,                  # 梯度裁剪
+        policy_loss_weight: float = 1.0,         # 策略损失权重
+        value_loss_weight: float = 1.0,          # 价值损失权重
+        value_loss_delta: float = 0.5,           # HuberLoss delta
+        # ── 并行参数 ──
+        num_workers: int = 16,                   # Worker 数
+        max_batch_size: int = 128,               # 最大批大小
+        # ── 存档参数 ──
+        checkpoint_dir: str = "checkpoints/transformer_train",
+        save_interval: int = 1,                  # 存档间隔（迭代）
+        save_replay_interval: int = 1,           # 回放缓冲区存档间隔
+        save_image_every_n_games: int = 50,      # 图片保存间隔
+        # ── 设备 ──
+        device: str = "auto",
+        initial_model: Optional[str] = None,
+        resume: bool = False,
+    ):
+        # 将全部参数设置为实例属性
+        for k, v in locals().items():
+            if k != 'self':
+                setattr(self, k, v)
+
+    def to_dict(self) -> dict:
+        """导出为字典（用于存档）。"""
+        return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
+
+    @classmethod
+    def from_dict(cls, d: dict):
+        """从字典恢复配置。"""
+        valid_keys = cls().__dict__.keys()
+        return cls(**{k: v for k, v in d.items() if k in valid_keys})
+
+    def get_model_config(self) -> dict:
+        """返回网络模型配置字典（用于构造 GoBangTransformer_v2）。"""
+        return {
+            'arch_type': 'transformer',
+            'd_model': self.d_model,
+            'num_heads': self.num_heads,
+            'num_layers': self.num_layers,
+            'ff_expand': self.ff_expand,
+            'dropout': self.dropout,
+            'board_size': self.board_size,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════
 #  预训练配置 (pre_train.py) — 从数据学习
 # ═══════════════════════════════════════════════════════════════
 

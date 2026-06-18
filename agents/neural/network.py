@@ -162,3 +162,17 @@ class ActorCriticNet(nn.Module):
         policy_logits = policy_logits.masked_fill(occupied, -float('inf'))
 
         return policy_logits, value
+
+    @property
+    def arch_type(self) -> str:
+        """返回架构标识，用于 AZAgent 自动推断网络类型。"""
+        return "cnn"
+
+    def get_config(self) -> dict:
+        """返回网络配置字典，用于存档和恢复。"""
+        return {
+            'arch_type': 'cnn',
+            'num_res_blocks': len(self.res_blocks),
+            'channels': self.channels,
+            'board_size': self.board_size,
+        }
