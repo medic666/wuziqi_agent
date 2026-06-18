@@ -47,72 +47,66 @@ class RoPE2D(nn.Module):
         board_size: 棋盘大小（默认15）
     """
 
-    def __init__(self, head_dim: int = 16, board_size: int = 15):
+    def __init__(self, dim: int = 64, board_size: int = 15):
+        """
+        Args:
+            dim: 被旋转的特征维度（必须是偶数），可以是 head_dim 或 d_model
+            board_size: 棋盘大小
+        """
         super().__init__()
-        if head_dim % 2 != 0:
-            raise ValueError(f"head_dim 必须为偶数，当前值: {head_dim}")
+        if dim % 2 != 0:
+            raise ValueError(f"dim 必须为偶数，当前值: {dim}")
 
-        self.head_dim = head_dim
+        self.dim = dim
         self.board_size = board_size
-        half_dim = head_dim // 2  # 8对维度（每对 = 2维共享一个频率）
+        half_dim = dim // 2  # 维度对数 = 32（当 dim=64）
 
-        # ★ 修正 RoPE 频率：用完整的 half_dim 个频率，分母 half_dim
-        # 标准公式: θ_i = 10000^(-i/(d/2)), i ∈ [0, d/2)
-        # 将 8 个频率分成两组：偶频率给行 → 4个, 奇频率给列 → 4个
+        # 标准 RoPE 频率: θ_i = 10000^(-i/(d/2)), i ∈ [0, d/2)
         inv_freq = 1.0 / (
             10000 ** (torch.arange(0, half_dim, dtype=torch.float32) / half_dim)
-        )  # shape: (8,) 频率范围: 1.0 ~ 0.0056（之前只有 1.0 ~ 0.001）
-        inv_freq_row = inv_freq[0::2]  # (4,) 行 → 0,2,4,6
-        inv_freq_col = inv_freq[1::2]  # (4,) 列 → 1,3,5,7
+        )  # (32,) 频率: 1.0 ~ 0.0056
+        inv_freq_row = inv_freq[0::2]  # (16,) 行 → 偶数索引
+        inv_freq_col = inv_freq[1::2]  # (16,) 列 → 奇数索引
 
-        # 为棋盘每个格子生成行索引和列索引
         rows = torch.arange(board_size).repeat_interleave(board_size)  # (225,)
         cols = torch.arange(board_size).repeat(board_size)             # (225,)
 
-        # 计算角度: 每个位置产生 4 个行 + 4 个列角度
-        theta_row = rows[:, None].float() * inv_freq_row[None, :]  # (225, 4)
-        theta_col = cols[:, None].float() * inv_freq_col[None, :]  # (225, 4)
+        theta_row = rows[:, None].float() * inv_freq_row[None, :]  # (225, 16)
+        theta_col = cols[:, None].float() * inv_freq_col[None, :]  # (225, 16)
 
-        # 交错拼接成 (225, 8): [row0, col0, row1, col1, row2, col2, row3, col3]
-        # 共 8 个角度对应 8 个维度对
-        theta = torch.empty(board_size * board_size, half_dim)  # (225, 8)
-        theta[:, 0::2] = theta_row  # 偶数索引放行角度
-        theta[:, 1::2] = theta_col  # 奇数索引放列角度
+        # 交错: [row0, col0, row1, col1, ..., row15, col15]
+        theta = torch.empty(board_size * board_size, half_dim)  # (225, 32)
+        theta[:, 0::2] = theta_row
+        theta[:, 1::2] = theta_col
 
-        # 预计算余弦、正弦表，注册为 buffer（不参与梯度但随模型移动）
-        self.register_buffer('cos_table', torch.cos(theta))  # (225, 8)
-        self.register_buffer('sin_table', torch.sin(theta))  # (225, 8)
+        self.register_buffer('cos_table', torch.cos(theta))  # (225, 32)
+        self.register_buffer('sin_table', torch.sin(theta))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         对输入张量施加 2D RoPE 旋转。
 
         Args:
-            x: (B, H, N, D) 其中 D=head_dim, N=board_size*board_size
+            x: (B, H, N, D)  D=dim 或 D=head_dim
 
         Returns:
-            施加旋转后的张量，形状同输入 (B, H, N, D)
+            (B, H, N, D) 施加旋转后的张量
         """
         B, H, N, D = x.shape
-        half_dim = D // 2  # 8
+        half_dim = D // 2
 
-        # 将最后一维重塑为 half_dim 对: (偶, 奇)
-        x = x.view(B, H, N, half_dim, 2)  # (B, H, N, 8, 2)
-        x_even = x[..., 0]  # (B, H, N, 8) 偶数位置
-        x_odd = x[..., 1]   # (B, H, N, 8) 奇数位置
+        x = x.view(B, H, N, half_dim, 2)  # (B, H, N, half_dim, 2)
+        x_even = x[..., 0]
+        x_odd = x[..., 1]
 
-        # 取出对应位置的 cos/sin，自动广播为 (1, 1, N, half_dim)
-        cos = self.cos_table[None, None, :, :]  # (1, 1, 225, 8)
+        cos = self.cos_table[None, None, :, :]  # (1, 1, 225, half_dim)
         sin = self.sin_table[None, None, :, :]
 
-        # 逐对旋转公式 (将每对维度视为复数 a+ib 乘以 e^{iθ})
         out_even = x_even * cos - x_odd * sin
         out_odd = x_even * sin + x_odd * cos
 
-        # 拼回原形状 (B, H, N, D)
-        out = torch.stack([out_even, out_odd], dim=-1)  # (B, H, N, 8, 2)
+        out = torch.stack([out_even, out_odd], dim=-1)
         out = out.view(B, H, N, D)
-
         return out
 
 
@@ -122,9 +116,9 @@ class RoPE2D(nn.Module):
 
 class MultiHeadSelfAttention2D(nn.Module):
     """
-    含修正 2D-RoPE 的多头自注意力（Pre-LN 兼容）。
+    纯多头自注意力（RoPE 已移至嵌入层，注意力层无位置编码）。
 
-    流程: q/k/v投影 → 重塑多头 → RoPE2D施加(q,k) → 缩放点积注意力 → 输出投影
+    流程: q/k/v投影 → 重塑多头 → 缩放点积注意力 → 输出投影
 
     Args:
         d_model: 模型维度（默认64）
@@ -147,9 +141,6 @@ class MultiHeadSelfAttention2D(nn.Module):
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
-
-        # 2D RoPE
-        self.rope_2d = RoPE2D(head_dim=self.head_dim, board_size=board_size)
 
         # Dropout
         self.attn_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
@@ -174,15 +165,8 @@ class MultiHeadSelfAttention2D(nn.Module):
         k = k.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # 施加 2D RoPE（对 q, k, v 均施加，打破空位同质化）
-        q = self.rope_2d(q)
-        k = self.rope_2d(k)
-        v = self.rope_2d(v)
-
         # ★ 使用 PyTorch 内置 scaled_dot_product_attention
         #   自动选择最优后端: FlashAttention (CUDA+fp16/bf16) → Memory Efficient → 朴素实现
-        #   dropout 仅在训练时生效，eval 模式自动忽略
-        #   RoPE 在 q,k 上已施加完毕，FlashAttention 完全兼容
         scale = math.sqrt(self.head_dim)
         out = F.scaled_dot_product_attention(
             q, k, v,
@@ -318,6 +302,7 @@ class GoBangTransformer_v2(nn.Module):
         # ═══════════════ 嵌入层 ═══════════════
         # 每个位置有3个值(己方/对方/上一步) → d_model 维
         self.embed = nn.Linear(3, d_model)
+        self.rope_embed = RoPE2D(dim=d_model, board_size=board_size)  # 乘性位置编码
         self.ln_embed = nn.LayerNorm(d_model)
         self.embed_dropout = nn.Dropout(dropout)
 
@@ -393,6 +378,9 @@ class GoBangTransformer_v2(nn.Module):
 
         # Linear 嵌入: (B, 225, 3) → (B, 225, 64)
         x = self.embed(x)
+        # ★ 乘性 2D-RoPE 位置编码：每个格子的嵌入向量被旋转到独特角度
+        #   RoPE2D 期望 (B, H, N, D)，此处 H=1（在 d_model 维度上做逐对旋转）
+        x = self.rope_embed(x.unsqueeze(1)).squeeze(1)  # (B, 225, 64)
         x = self.ln_embed(x)
         x = self.embed_dropout(x)
 
