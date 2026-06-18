@@ -3,7 +3,7 @@
 基于 Transformer 架构的五子棋神经网络 (GoBangTransformer_v2)
 
 架构: 3通道输入 + Pre-LN Transformer块 + FFN + GAP价值头
-  - 2D-RoPE 旋转位置编码（15×15棋盘逐对旋转）
+  - 2D-RoPE 旋转位置编码（施加于注意力 Q/K，15×15棋盘逐对旋转）
   - Pre-LN 残差Transformer块 × 5（含Dropout正则化）
   - 策略头: MLP 逐位置投影 → logits (225维)
   - 价值头: MLP + GAP + tanh → [-1, 1]
@@ -40,18 +40,20 @@ class RoPE2D(nn.Module):
 
     预计算:
       - 为棋盘每个格子 (row, col) 预计算 cos/sin 表，形状 (225, half_dim)
-      - 频率按 θ = 10000^(-2i/d) 生成，i = 0, 2, 4, 6 (共4个频率)
+      - 频率按 θ = base^(-2i/d) 生成，基于 head_dim 维度逐对旋转
 
     Args:
-        head_dim: 注意力头维度（必须是偶数，默认16）
+        dim: 注意力头维度（必须是偶数，默认16）
         board_size: 棋盘大小（默认15）
+        base: 频率基数（默认20，适用于15×15棋盘）
     """
 
-    def __init__(self, dim: int = 64, board_size: int = 15):
+    def __init__(self, dim: int = 64, board_size: int = 15, base: float = 20.0):
         """
         Args:
-            dim: 被旋转的特征维度（必须是偶数），可以是 head_dim 或 d_model
+            dim: 被旋转的特征维度（必须是偶数），用于 head_dim
             board_size: 棋盘大小
+            base: RoPE 频率基数（越小则频率越高，15×15 棋盘推荐 20）
         """
         super().__init__()
         if dim % 2 != 0:
@@ -59,12 +61,13 @@ class RoPE2D(nn.Module):
 
         self.dim = dim
         self.board_size = board_size
-        half_dim = dim // 2  # 维度对数 = 32（当 dim=64）
+        self.base = base
+        half_dim = dim // 2  # 维度对数
 
-        # 标准 RoPE 频率: θ_i = 10000^(-i/(d/2)), i ∈ [0, d/2)
+        # 标准 RoPE 频率: θ_i = base^(-i/(d/2)), i ∈ [0, d/2)
         inv_freq = 1.0 / (
-            10000 ** (torch.arange(0, half_dim, dtype=torch.float32) / half_dim)
-        )  # (32,) 频率: 1.0 ~ 0.0056
+            base ** (torch.arange(0, half_dim, dtype=torch.float32) / half_dim)
+        )
         inv_freq_row = inv_freq[0::2]  # (16,) 行 → 偶数索引
         inv_freq_col = inv_freq[1::2]  # (16,) 列 → 奇数索引
 
@@ -116,9 +119,9 @@ class RoPE2D(nn.Module):
 
 class MultiHeadSelfAttention2D(nn.Module):
     """
-    纯多头自注意力（RoPE 已移至嵌入层，注意力层无位置编码）。
+    多头自注意力（含 2D-RoPE 施加于 Q/K）。
 
-    流程: q/k/v投影 → 重塑多头 → 缩放点积注意力 → 输出投影
+    流程: q/k/v投影 → 重塑多头 → 2D-RoPE(Q/K) → 缩放点积注意力 → 输出投影
 
     Args:
         d_model: 模型维度（默认64）
@@ -145,6 +148,9 @@ class MultiHeadSelfAttention2D(nn.Module):
         # Dropout
         self.attn_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
+        # 2D-RoPE 旋转位置编码（施加于 Q 和 K，在 head_dim 维度上逐对旋转）
+        self.rope_qk = RoPE2D(dim=self.head_dim, board_size=board_size)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -164,6 +170,10 @@ class MultiHeadSelfAttention2D(nn.Module):
         q = q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # ★ 2D-RoPE 施加于 Q 和 K（在 head_dim 维度上逐对旋转）
+        q = self.rope_qk(q)
+        k = self.rope_qk(k)
 
         # ★ 使用 PyTorch 内置 scaled_dot_product_attention
         #   自动选择最优后端: FlashAttention (CUDA+fp16/bf16) → Memory Efficient → 朴素实现
@@ -302,7 +312,7 @@ class GoBangTransformer_v2(nn.Module):
         # ═══════════════ 嵌入层 ═══════════════
         # 每个位置有3个值(己方/对方/上一步) → d_model 维
         self.embed = nn.Linear(3, d_model)
-        self.rope_embed = RoPE2D(dim=d_model, board_size=board_size)  # 乘性位置编码
+        # RoPE 已移入 MultiHeadSelfAttention2D 内部，嵌入层不再需要
         self.ln_embed = nn.LayerNorm(d_model)
         self.embed_dropout = nn.Dropout(dropout)
 
@@ -342,12 +352,12 @@ class GoBangTransformer_v2(nn.Module):
         """
         权重初始化。
 
-        - Linear: Xavier Uniform (适合 Transformer + GELU/ReLU)
+        - Linear: Kaiming Uniform (适合 ReLU/GELU 激活)
         - LayerNorm: weight=1, bias=0
         """
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
+                nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.LayerNorm):
@@ -378,9 +388,6 @@ class GoBangTransformer_v2(nn.Module):
 
         # Linear 嵌入: (B, 225, 3) → (B, 225, 64)
         x = self.embed(x)
-        # ★ 乘性 2D-RoPE 位置编码：每个格子的嵌入向量被旋转到独特角度
-        #   RoPE2D 期望 (B, H, N, D)，此处 H=1（在 d_model 维度上做逐对旋转）
-        x = self.rope_embed(x.unsqueeze(1)).squeeze(1)  # (B, 225, 64)
         x = self.ln_embed(x)
         x = self.embed_dropout(x)
 
