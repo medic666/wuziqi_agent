@@ -54,30 +54,34 @@ class RoPE2D(nn.Module):
 
         self.head_dim = head_dim
         self.board_size = board_size
-        half_dim = head_dim // 2  # 8对
+        half_dim = head_dim // 2  # 8对维度（每对 = 2维共享一个频率）
 
-        # 生成频率（每对维度共享一个频率）
-        # inv_freq shape: (half_dim // 2,) = (4,)
+        # ★ 修正 RoPE 频率：用完整的 half_dim 个频率，分母 half_dim
+        # 标准公式: θ_i = 10000^(-i/(d/2)), i ∈ [0, d/2)
+        # 将 8 个频率分成两组：偶频率给行 → 4个, 奇频率给列 → 4个
         inv_freq = 1.0 / (
-            10000 ** (torch.arange(0, half_dim, 2, dtype=torch.float32) / half_dim)
-        )
+            10000 ** (torch.arange(0, half_dim, dtype=torch.float32) / half_dim)
+        )  # shape: (8,) 频率范围: 1.0 ~ 0.0056（之前只有 1.0 ~ 0.001）
+        inv_freq_row = inv_freq[0::2]  # (4,) 行 → 0,2,4,6
+        inv_freq_col = inv_freq[1::2]  # (4,) 列 → 1,3,5,7
 
         # 为棋盘每个格子生成行索引和列索引
         rows = torch.arange(board_size).repeat_interleave(board_size)  # (225,)
         cols = torch.arange(board_size).repeat(board_size)             # (225,)
 
-        # 计算角度: 每个位置产生 4个行角度 + 4个列角度
-        theta_row = rows[:, None].float() * inv_freq[None, :]  # (225, 4)
-        theta_col = cols[:, None].float() * inv_freq[None, :]  # (225, 4)
+        # 计算角度: 每个位置产生 4 个行 + 4 个列角度
+        theta_row = rows[:, None].float() * inv_freq_row[None, :]  # (225, 4)
+        theta_col = cols[:, None].float() * inv_freq_col[None, :]  # (225, 4)
 
-        # 交错拼接成 (225, 8)，顺序: [row0, col0, row1, col1, row2, col2, row3, col3]
-        theta = torch.empty(board_size * board_size, half_dim)
+        # 交错拼接成 (225, 8): [row0, col0, row1, col1, row2, col2, row3, col3]
+        # 共 8 个角度对应 8 个维度对
+        theta = torch.empty(board_size * board_size, half_dim)  # (225, 8)
         theta[:, 0::2] = theta_row  # 偶数索引放行角度
         theta[:, 1::2] = theta_col  # 奇数索引放列角度
 
         # 预计算余弦、正弦表，注册为 buffer（不参与梯度但随模型移动）
-        self.register_buffer('cos_table', torch.cos(theta))  # (225, half_dim)
-        self.register_buffer('sin_table', torch.sin(theta))  # (225, half_dim)
+        self.register_buffer('cos_table', torch.cos(theta))  # (225, 8)
+        self.register_buffer('sin_table', torch.sin(theta))  # (225, 8)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -170,9 +174,10 @@ class MultiHeadSelfAttention2D(nn.Module):
         k = k.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # 施加 2D RoPE（仅对 q 和 k）
+        # 施加 2D RoPE（对 q, k, v 均施加，打破空位同质化）
         q = self.rope_2d(q)
         k = self.rope_2d(k)
+        v = self.rope_2d(v)
 
         # ★ 使用 PyTorch 内置 scaled_dot_product_attention
         #   自动选择最优后端: FlashAttention (CUDA+fp16/bf16) → Memory Efficient → 朴素实现
