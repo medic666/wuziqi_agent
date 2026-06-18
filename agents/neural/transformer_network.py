@@ -352,14 +352,15 @@ class GoBangTransformer_v2(nn.Module):
         """
         权重初始化。
 
-        - Linear: Kaiming Uniform (适合 ReLU/GELU 激活)
+        - Linear: Kaiming Uniform (适合 ReLU/GELU 激活), bias 使用 PyTorch 默认
+          U(-1/√fan_in, 1/√fan_in)
         - LayerNorm: weight=1, bias=0
         """
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+                # bias 保持 PyTorch 默认值（非零），解决嵌入层全零空格导致
+                # RoPE 在第一层 MHA 中无法生效的问题
             elif isinstance(m, nn.LayerNorm):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
