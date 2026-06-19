@@ -451,9 +451,11 @@ class AlphaZeroTrainer:
     def _load_initial_model(self, path):
         logger.info(f"加载预训练模型: {path}")
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        state_dict = ckpt.get('model_state_dict', ckpt)
-        self.best_model.load_state_dict(state_dict)
-        self.new_model.load_state_dict(state_dict)
+        from agents.neural.registry import build_model_from_checkpoint
+        model, arch_type, kwargs = build_model_from_checkpoint(ckpt, device=self.device)
+        logger.info(f"  检测到架构: {arch_type} (channels={kwargs.get('channels')}, blocks={kwargs.get('num_res_blocks')})")
+        self.best_model.load_state_dict(model.state_dict())
+        self.new_model.load_state_dict(model.state_dict())
         logger.info("✓ 预训练模型加载成功 (best_model + new_model 同步)")
 
     def _load_checkpoint(self) -> bool:
@@ -484,7 +486,10 @@ class AlphaZeroTrainer:
                 logger.info(f"  回放缓冲区恢复: {len(data['states']):,} 样本")
 
             best_path = os.path.join(self.config.checkpoint_dir, 'best_model.pt')
-            torch.save({'model_state_dict': self.best_model.state_dict()}, best_path)
+            torch.save({
+                'model_state_dict': self.best_model.state_dict(),
+                'model_config': self.best_model.get_config(),
+            }, best_path)
 
             phase_msg = "完整迭代" if self.current_phase == 0 else f"阶段{self.current_phase}"
             logger.info(f"  ✓ 恢复至迭代 {self.current_iteration + 1} | 阶段: {phase_msg} | 缓冲区 {self.replay_buffer.size:,} 样本")
@@ -582,7 +587,10 @@ class AlphaZeroTrainer:
         logger.info(f"  竞技场: 新模型 vs 最佳模型 ({self.config.arena_games} 局 ★并发)")
         
         new_model_path = os.path.join(self.config.checkpoint_dir, 'new_model_arena.pt')
-        torch.save({'model_state_dict': self.new_model.state_dict()}, new_model_path)
+        torch.save({
+            'model_state_dict': self.new_model.state_dict(),
+            'model_config': self.new_model.get_config(),
+        }, new_model_path)
         best_model_path = os.path.join(self.config.checkpoint_dir, 'best_model.pt')
         
         server = DualInferenceServer(
@@ -778,8 +786,10 @@ class AlphaZeroTrainer:
             'current_phase': phase,
         }
         self._atomic_save(state, os.path.join(self.config.checkpoint_dir, 'latest_checkpoint.pt'))
-        self._atomic_save({'model_state_dict': self.best_model.state_dict()}, 
-                  os.path.join(self.config.checkpoint_dir, 'best_model.pt'))
+        self._atomic_save({
+            'model_state_dict': self.best_model.state_dict(),
+            'model_config': self.best_model.get_config(),
+        }, os.path.join(self.config.checkpoint_dir, 'best_model.pt'))
         if save_replay: self._save_replay_buffer()
 
     def _save_replay_buffer(self):
@@ -799,7 +809,10 @@ class AlphaZeroTrainer:
         best_model_path = os.path.join(self.config.checkpoint_dir, 'best_model.pt')
         os.makedirs(self.config.checkpoint_dir, exist_ok=True)
         if not os.path.exists(best_model_path):
-            torch.save({'model_state_dict': self.best_model.state_dict()}, best_model_path)
+            torch.save({
+                'model_state_dict': self.best_model.state_dict(),
+                'model_config': self.best_model.get_config(),
+            }, best_model_path)
 
         for iteration in range(self.current_iteration, self.config.num_iterations):
             if self._should_stop: break
@@ -865,7 +878,10 @@ class AlphaZeroTrainer:
                             history_dir = os.path.join(self.config.checkpoint_dir, "history_best_models")
                             os.makedirs(history_dir, exist_ok=True)
                             history_best_path = os.path.join(history_dir, f'best_model_iter_{iteration+1}.pt')
-                            torch.save({'model_state_dict': self.best_model.state_dict()}, history_best_path)
+                            torch.save({
+                                'model_state_dict': self.best_model.state_dict(),
+                                'model_config': self.best_model.get_config(),
+                            }, history_best_path)
                             logger.info(f"  ★ 新模型胜出，已更新为最佳模型 (历史快照已保存: {os.path.basename(history_best_path)})")
                         else:
                             logger.info(f"  新模型未胜出(胜率{arena_win_rate:.1%})，保留当前权重继续训练")

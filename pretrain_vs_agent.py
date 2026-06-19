@@ -404,8 +404,10 @@ class AgentPreTrainer:
         torch.save(state, os.path.join(self.config.checkpoint_dir, 'latest_checkpoint.pt'))
         
         if is_best:
-            torch.save({'model_state_dict': self.model.state_dict()},
-                       os.path.join(self.config.checkpoint_dir, 'best_model.pt'))
+            torch.save({
+                'model_state_dict': self.model.state_dict(),
+                'model_config': self.model.get_config(),
+            }, os.path.join(self.config.checkpoint_dir, 'best_model.pt'))
 
         # 每3轮保存一次回放缓冲区（文件较大，减少IO）
         if (self.current_iteration + 1) % 3 == 0:

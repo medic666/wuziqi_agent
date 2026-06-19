@@ -98,9 +98,22 @@ def infer_arch_from_state_dict(state_dict: dict) -> str:
 
     if any_key == 'embed.weight' or any_key.startswith('blocks.'):
         return 'transformer'
-    elif any_key.startswith('stem_conv.') or any_key.startswith('res_blocks.'):
-        # CNN v2 和 v3 权重结构相同，无法区分，保守回退 v2
-        # 用户如需 v3 应显式传入 arch_type
+
+    # CNN: 通过 v3 独有键区分 v2 和 v3（最后防线）
+    # v3 独有: cls_token, value_cross_attn.*, value_ln.*, value_mlp.*
+    # v2 独有: value_conv1/2/3, value_bn1/2, value_fc1/2
+    v3_markers = ['cls_token', 'value_cross_attn.in_proj_weight',
+                   'value_ln.weight', 'value_mlp.0.weight']
+    v2_markers = ['value_conv1.weight', 'value_bn1.weight',
+                   'value_fc1.weight', 'value_fc2.weight']
+
+    if any(k in state_dict for k in v3_markers):
+        return 'cnn_v3'
+    if any(k in state_dict for k in v2_markers):
+        return 'cnn_v2'
+
+    # 保守回退：stem_conv / res_blocks 存在但无法区分时 → v2
+    if any_key.startswith('stem_conv.') or any_key.startswith('res_blocks.'):
         return 'cnn_v2'
 
     # 未知结构回退

@@ -289,7 +289,10 @@ class JointTrainer:
                  'best_val_loss': self.best_val_loss, 'es_counter': self.es_counter, 'config': self.config.to_dict()}
         if not is_best: torch.save(state, os.path.join(self.config.checkpoint_dir, 'latest_checkpoint.pt'))
         else:
-            torch.save({'model_state_dict': self.model.state_dict()}, os.path.join(self.config.checkpoint_dir, 'best_model.pt'))
+            torch.save({
+                'model_state_dict': self.model.state_dict(),
+                'model_config': self.model.get_config(),
+            }, os.path.join(self.config.checkpoint_dir, 'best_model.pt'))
             torch.save(state, os.path.join(self.config.checkpoint_dir, 'latest_checkpoint.pt'))
 
     def _load_checkpoint(self):

@@ -87,27 +87,11 @@ def main():
     if args.model_path:
         print(f"加载模型: {args.model_path}")
         try:
+            from agents.neural.registry import build_model_from_checkpoint
             ckpt = torch.load(args.model_path, map_location='cpu', weights_only=False)
-            config = ckpt.get('model_config', {})
-            state_dict = ckpt.get('model_state_dict', ckpt)
-            arch_type = resolve_arch(config.get('arch_type', None) or infer_arch_from_state_dict(state_dict))
+            model, arch_type, kwargs = build_model_from_checkpoint(ckpt)
             print(f"  检测到架构: {arch_type}")
-            NetworkClass = get_network_class(arch_type)
-            defaults = get_defaults(arch_type)
-            kwargs = {**defaults}
-            for k in config:
-                if k != 'arch_type' and k in kwargs:
-                    kwargs[k] = config[k]
-            if arch_type in ('cnn_v2', 'cnn_v3'):
-                kwargs['channels'] = state_dict['stem_conv.weight'].shape[0]
-                res_idx = [int(k.split('.')[1]) for k in state_dict if k.startswith('res_blocks.')]
-                kwargs['num_res_blocks'] = max(res_idx) + 1 if res_idx else kwargs['num_res_blocks']
-            if arch_type == 'transformer':
-                kwargs['d_model'] = state_dict['embed.weight'].shape[0]
-                blk_idx = [int(k.split('.')[1]) for k in state_dict if k.startswith('blocks.')]
-                kwargs['num_layers'] = max(blk_idx) + 1 if blk_idx else kwargs['num_layers']
-            model = NetworkClass(**kwargs)
-            model.load_state_dict(state_dict)
+            print(f"  参数量: {sum(p.numel() for p in model.parameters()):,}")
             print("✓ 权重加载成功！\n")
         except Exception as e:
             import traceback

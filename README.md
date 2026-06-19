@@ -80,6 +80,29 @@ wuziqi_agent/
 
 ---
 
+## Checkpoint 格式规范 (v12+)
+
+所有训练脚本保存的模型文件 **必须** 包含 `model_config` 字段，使 downstream 消费者无需猜测架构类型。
+
+```json
+{
+    "model_state_dict": OrderedDict(...),   // 模型权重
+    "model_config": {                       // ★ 架构元数据（强制）
+        "arch_type": "cnn_v3",              // 架构标识 (cnn_v2 | cnn_v3 | transformer)
+        "num_res_blocks": 5,                // CNN 残差块数
+        "channels": 64,                     // CNN 通道数
+        "board_size": 15
+    }
+}
+```
+
+**设计原则：**
+- **生产者写入元数据** — 所有 save 点（`best_model.pt`、`new_model_arena.pt`、历史快照）统一写入 `model.get_config()` 产出的 `model_config`
+- **消费者单一入口** — 所有加载统一调用 `registry.build_model_from_checkpoint()`，该函数是唯一真理源
+- **最后防线** — 如果旧 checkpoint 缺失 `model_config`，`infer_arch_from_state_dict()` 从权重键名推断架构作为 fallback
+
+---
+
 ## 完整训练流程
 
 ### 1. 收集训练数据

@@ -33,8 +33,8 @@ def _infer_network_from_checkpoint(ckpt: dict, device: torch.device):
     """
     从 checkpoint 自动推断网络架构并实例化。
 
-    根据 checkpoint 中保存的 arch_type 或从权重键名推断架构类型，
-    提取对应的超参数，实例化正确的网络类。
+    委托给 registry.build_model_from_checkpoint，该函数是单一真理源。
+    所有重复逻辑已删除，只保留薄封装。
 
     Args:
         ckpt: 加载的 checkpoint 字典
@@ -43,65 +43,8 @@ def _infer_network_from_checkpoint(ckpt: dict, device: torch.device):
     Returns:
         实例化的网络模型 (已加载权重，eval模式)
     """
-    state_dict = ckpt.get('model_state_dict', ckpt)
-    config = ckpt.get('model_config', {})
-
-    # 优先从 config 读取 arch_type，兼容旧别名映射
-    arch_type = config.get('arch_type', None)
-    if arch_type is not None:
-        arch_type = resolve_arch(arch_type)
-    else:
-        arch_type = infer_arch_from_state_dict(state_dict)
-
-    # 获取网络类和参数
-    network_cls = get_network_class(arch_type)
-    param_names = get_param_names(arch_type)
-    defaults = get_defaults(arch_type)
-
-    # 构建构造函数参数，优先 config，其次从权重推断，最后默认值
-    kwargs = {}
-    for pname in param_names:
-        if pname in config:
-            kwargs[pname] = config[pname]
-
-    # CNN 特殊处理：从权重推断通道数和残差块数（兼容旧checkpoint）
-    if arch_type in ('cnn_v2', 'cnn_v3'):
-        if 'channels' not in kwargs:
-            kwargs['channels'] = state_dict['stem_conv.weight'].shape[0]
-        if 'num_res_blocks' not in kwargs:
-            res_block_indices = [
-                int(k.split('.')[1]) for k in state_dict if k.startswith('res_blocks.')
-            ]
-            kwargs['num_res_blocks'] = max(res_block_indices) + 1 if res_block_indices else defaults['num_res_blocks']
-        if 'board_size' not in kwargs:
-            kwargs['board_size'] = 15
-
-    # Transformer 特殊处理：从权重推断参数（兼容未保存config的checkpoint）
-    if arch_type == 'transformer':
-        if 'd_model' not in kwargs:
-            kwargs['d_model'] = state_dict['embed.weight'].shape[0]
-        if 'num_layers' not in kwargs:
-            block_indices = [
-                int(k.split('.')[1]) for k in state_dict if k.startswith('blocks.')
-            ]
-            kwargs['num_layers'] = max(block_indices) + 1 if block_indices else defaults['num_layers']
-        if 'num_heads' not in kwargs:
-            kwargs['num_heads'] = 4  # 默认值
-        if 'board_size' not in kwargs:
-            kwargs['board_size'] = 15
-        kwargs.setdefault('ff_expand', 4)
-        kwargs.setdefault('dropout', 0.1)
-
-    # 补全缺失参数为默认值
-    for pname in param_names:
-        if pname not in kwargs:
-            kwargs[pname] = defaults.get(pname, 15)
-
-    # 实例化模型
-    model = network_cls(**kwargs).to(device)
-    model.load_state_dict(state_dict)
-    model.eval()
-
+    from agents.neural.registry import build_model_from_checkpoint
+    model, _, _ = build_model_from_checkpoint(ckpt, device=device)
     return model
 
 
