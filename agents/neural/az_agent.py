@@ -18,14 +18,7 @@ MCTS 搜索树，大幅减少重复计算。
 import torch
 from typing import Tuple, Optional, Type
 from core.gamerules import GameState
-from agents.neural.registry import (
-    NETWORK_REGISTRY,
-    get_network_class,
-    get_param_names,
-    get_defaults,
-    resolve_arch,
-    infer_arch_from_state_dict,
-)
+from agents.neural.registry import build_model_from_checkpoint
 from search.mcts import MCTS, create_local_eval_fn
 
 
@@ -34,7 +27,6 @@ def _infer_network_from_checkpoint(ckpt: dict, device: torch.device):
     从 checkpoint 自动推断网络架构并实例化。
 
     委托给 registry.build_model_from_checkpoint，该函数是单一真理源。
-    所有重复逻辑已删除，只保留薄封装。
 
     Args:
         ckpt: 加载的 checkpoint 字典
@@ -43,7 +35,6 @@ def _infer_network_from_checkpoint(ckpt: dict, device: torch.device):
     Returns:
         实例化的网络模型 (已加载权重，eval模式)
     """
-    from agents.neural.registry import build_model_from_checkpoint
     model, _, _ = build_model_from_checkpoint(ckpt, device=device)
     return model
 

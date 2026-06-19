@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from core.gamerules import GameState, GomokuRules
-from agents.neural.registry import get_network_class, get_defaults
+from agents.neural.registry import build_model_from_config, build_model_from_checkpoint
 from search.mcts import MCTS, state_to_tensor, create_local_eval_fn
 from training.inference_server import InferenceServer, DualInferenceServer
 from training.replay_buffer import ReplayBuffer
@@ -393,8 +393,8 @@ class AlphaZeroTrainer:
         self.current_phase = 0
         self._should_stop = False
 
-        self.best_model = ActorCriticNet(config.num_res_blocks, config.channels, config.board_size).to(self.device)
-        self.new_model = ActorCriticNet(config.num_res_blocks, config.channels, config.board_size).to(self.device)
+        self.best_model = build_model_from_config(config.arch_type, config.arch_params, device=self.device)
+        self.new_model = build_model_from_config(config.arch_type, config.arch_params, device=self.device)
         self.replay_buffer = ReplayBuffer(config.replay_buffer_size)
 
         self.value_loss_fn = nn.HuberLoss(delta=config.value_loss_delta)
@@ -451,7 +451,6 @@ class AlphaZeroTrainer:
     def _load_initial_model(self, path):
         logger.info(f"加载预训练模型: {path}")
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        from agents.neural.registry import build_model_from_checkpoint
         model, arch_type, kwargs = build_model_from_checkpoint(ckpt, device=self.device)
         logger.info(f"  检测到架构: {arch_type} (channels={kwargs.get('channels')}, blocks={kwargs.get('num_res_blocks')})")
         self.best_model.load_state_dict(model.state_dict())
@@ -904,13 +903,20 @@ class AlphaZeroTrainer:
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--arch', type=str, default=None,
+                        help='网络架构: cnn_v2 | cnn_v3 | transformer (默认读取配置)')
     parser.add_argument('--initial_model', type=str, default=None)
     parser.add_argument('--resume', action='store_true', default=False)
     args = parser.parse_args()
 
-    config = AlphaZeroConfig()
-    if args.initial_model: config.initial_model = args.initial_model
-    if args.resume: config.resume = True
+    config_kwargs = {}
+    if args.arch:
+        config_kwargs['arch_type'] = args.arch
+    if args.initial_model:
+        config_kwargs['initial_model'] = args.initial_model
+    if args.resume:
+        config_kwargs['resume'] = True
+    config = AlphaZeroConfig(**config_kwargs)
 
     trainer = AlphaZeroTrainer(config)
     trainer.run()

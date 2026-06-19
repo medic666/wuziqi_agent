@@ -13,7 +13,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 from agents.neural.registry import get_network_class, infer_arch_from_state_dict, get_defaults, resolve_arch
-from agents.neural.cnn_v3 import ActorCriticNet_v3
 
 # ====== 全局设置中文字体防乱码 ======
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'PingFang SC', 'sans-serif']
