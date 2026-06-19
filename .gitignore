@@ -223,3 +223,5 @@ checkpoints/az_train/latest_checkpoint.pt
 checkpoints/az_train/replay_buffer.npz
 checkpoints/transformer_pretrain/latest_checkpoint.pt
 checkpoints/az_train/cnn_v3/game_images/
+checkpoints/az_train/cnn_v3/arena_images/
+checkpoints/az_train/cnn_v3/history_best_models/
