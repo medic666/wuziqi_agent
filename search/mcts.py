@@ -393,7 +393,7 @@ def create_local_eval_fn(model, device: torch.device):
         评估函数 callable
     """
     # 延迟导入避免循环依赖
-    from agents.neural.network import ActorCriticNet
+    from agents.neural.cnn_v2 import ActorCriticNet_v2 as ActorCriticNet
     
     @torch.no_grad()
     def eval_fn(state_np: np.ndarray):

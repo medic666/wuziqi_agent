@@ -12,7 +12,8 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib as mpl
-from agents.neural.network import ActorCriticNet
+from agents.neural.registry import get_network_class, infer_arch_from_state_dict, get_defaults, resolve_arch
+from agents.neural.cnn_v3 import ActorCriticNet_v3
 
 # ====== 全局设置中文字体防乱码 ======
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'PingFang SC', 'sans-serif']
@@ -65,22 +66,57 @@ def plot_policy_heatmap(policy_probs, my_pieces, opp_pieces, last_move, title):
     plt.tight_layout()
     plt.show()
 
+def _make_random_model(args):
+    """根据 --arch 创建随机权重模型"""
+    arch = args.arch
+    NetworkClass = get_network_class(arch)
+    defaults = get_defaults(arch)
+    print(f"  创建随机权重模型: {arch} (参数量: {sum(p.numel() for p in NetworkClass(**defaults).parameters()):,})")
+    return NetworkClass(**defaults)
+
+
 def main():
     parser = argparse.ArgumentParser()
-    # 修改1：修复文件路径反斜杠转义问题，改用正斜杠
-    parser.add_argument('--model_path', type=str, default="checkpoints/az_train/best_model.pt")
+    parser.add_argument('--model_path', type=str, default=None,
+                        help="模型路径 (自动推断架构)")
+    parser.add_argument('--arch', type=str, default='cnn_v3',
+                        choices=['cnn_v2', 'cnn_v3', 'transformer'],
+                        help="无 checkpoint 时使用的随机权重架构 (默认: cnn_v3)")
     args = parser.parse_args()
 
-    # 实例化模型 (可根据实际训练的参数调整 num_res_blocks)
-    model = ActorCriticNet(num_res_blocks=4, channels=128)
     if args.model_path:
         print(f"加载模型: {args.model_path}")
         try:
             ckpt = torch.load(args.model_path, map_location='cpu', weights_only=False)
-            model.load_state_dict(ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt)
+            config = ckpt.get('model_config', {})
+            state_dict = ckpt.get('model_state_dict', ckpt)
+            arch_type = resolve_arch(config.get('arch_type', None) or infer_arch_from_state_dict(state_dict))
+            print(f"  检测到架构: {arch_type}")
+            NetworkClass = get_network_class(arch_type)
+            defaults = get_defaults(arch_type)
+            kwargs = {**defaults}
+            for k in config:
+                if k != 'arch_type' and k in kwargs:
+                    kwargs[k] = config[k]
+            if arch_type in ('cnn_v2', 'cnn_v3'):
+                kwargs['channels'] = state_dict['stem_conv.weight'].shape[0]
+                res_idx = [int(k.split('.')[1]) for k in state_dict if k.startswith('res_blocks.')]
+                kwargs['num_res_blocks'] = max(res_idx) + 1 if res_idx else kwargs['num_res_blocks']
+            if arch_type == 'transformer':
+                kwargs['d_model'] = state_dict['embed.weight'].shape[0]
+                blk_idx = [int(k.split('.')[1]) for k in state_dict if k.startswith('blocks.')]
+                kwargs['num_layers'] = max(blk_idx) + 1 if blk_idx else kwargs['num_layers']
+            model = NetworkClass(**kwargs)
+            model.load_state_dict(state_dict)
             print("✓ 权重加载成功！\n")
         except Exception as e:
-            print(f"❌ 加载失败: {e}，使用随机权重\n")
+            import traceback
+            print(f"❌ 加载失败: {type(e).__name__}: {e}")
+            traceback.print_exc()
+            print("\n使用随机权重\n")
+            model = _make_random_model(args)
+    else:
+        model = _make_random_model(args)
     model.eval()
 
     # ==============================================

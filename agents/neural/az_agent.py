@@ -18,15 +18,15 @@ MCTS 搜索树，大幅减少重复计算。
 import torch
 from typing import Tuple, Optional, Type
 from core.gamerules import GameState
-from agents.neural.network import ActorCriticNet
-from agents.neural.transformer_network import GoBangTransformer_v2
+from agents.neural.registry import (
+    NETWORK_REGISTRY,
+    get_network_class,
+    get_param_names,
+    get_defaults,
+    resolve_arch,
+    infer_arch_from_state_dict,
+)
 from search.mcts import MCTS, create_local_eval_fn
-
-# 架构注册表：arch_type → (网络类, 构造函数参数名映射)
-_NETWORK_REGISTRY = {
-    'cnn': (ActorCriticNet, ['num_res_blocks', 'channels', 'board_size']),
-    'transformer': (GoBangTransformer_v2, ['d_model', 'num_heads', 'num_layers', 'ff_expand', 'dropout', 'board_size']),
-}
 
 
 def _infer_network_from_checkpoint(ckpt: dict, device: torch.device):
@@ -46,66 +46,56 @@ def _infer_network_from_checkpoint(ckpt: dict, device: torch.device):
     state_dict = ckpt.get('model_state_dict', ckpt)
     config = ckpt.get('model_config', {})
 
-    # 优先从 config 读取 arch_type
+    # 优先从 config 读取 arch_type，兼容旧别名映射
     arch_type = config.get('arch_type', None)
+    if arch_type is not None:
+        arch_type = resolve_arch(arch_type)
+    else:
+        arch_type = infer_arch_from_state_dict(state_dict)
 
-    # 如果 config 中没有，从权重键名自动推断
-    if arch_type is None:
-        any_key = next(iter(state_dict))
-        if any_key.startswith('stem_conv.'):
-            arch_type = 'cnn'
-        elif any_key == 'embed.weight' or any_key.startswith('blocks.'):
-            arch_type = 'transformer'
-        elif any_key.startswith('res_blocks.'):
-            arch_type = 'cnn'
-        else:
-            arch_type = 'cnn'  # 默认回退
+    # 获取网络类和参数
+    network_cls = get_network_class(arch_type)
+    param_names = get_param_names(arch_type)
+    defaults = get_defaults(arch_type)
 
-    if arch_type not in _NETWORK_REGISTRY:
-        raise ValueError(f"未知架构类型 '{arch_type}'，已知类型: {list(_NETWORK_REGISTRY.keys())}")
-
-    network_cls, param_names = _NETWORK_REGISTRY[arch_type]
-
-    # 构建构造函数参数
+    # 构建构造函数参数，优先 config，其次从权重推断，最后默认值
     kwargs = {}
     for pname in param_names:
         if pname in config:
             kwargs[pname] = config[pname]
 
     # CNN 特殊处理：从权重推断通道数和残差块数（兼容旧checkpoint）
-    if arch_type == 'cnn':
+    if arch_type in ('cnn_v2', 'cnn_v3'):
         if 'channels' not in kwargs:
             kwargs['channels'] = state_dict['stem_conv.weight'].shape[0]
         if 'num_res_blocks' not in kwargs:
             res_block_indices = [
                 int(k.split('.')[1]) for k in state_dict if k.startswith('res_blocks.')
             ]
-            kwargs['num_res_blocks'] = max(res_block_indices) + 1 if res_block_indices else 4
+            kwargs['num_res_blocks'] = max(res_block_indices) + 1 if res_block_indices else defaults['num_res_blocks']
         if 'board_size' not in kwargs:
             kwargs['board_size'] = 15
 
     # Transformer 特殊处理：从权重推断参数（兼容未保存config的checkpoint）
     if arch_type == 'transformer':
         if 'd_model' not in kwargs:
-            kwargs['d_model'] = state_dict['embed.weight'].shape[1]
+            kwargs['d_model'] = state_dict['embed.weight'].shape[0]
         if 'num_layers' not in kwargs:
             block_indices = [
                 int(k.split('.')[1]) for k in state_dict if k.startswith('blocks.')
             ]
-            kwargs['num_layers'] = max(block_indices) + 1 if block_indices else 5
+            kwargs['num_layers'] = max(block_indices) + 1 if block_indices else defaults['num_layers']
         if 'num_heads' not in kwargs:
-            # 从 q_proj 权重形状推断
             kwargs['num_heads'] = 4  # 默认值
         if 'board_size' not in kwargs:
             kwargs['board_size'] = 15
-        # 设置默认值
         kwargs.setdefault('ff_expand', 4)
         kwargs.setdefault('dropout', 0.1)
 
-    # 检查必需参数
+    # 补全缺失参数为默认值
     for pname in param_names:
         if pname not in kwargs:
-            kwargs[pname] = _get_default_param(arch_type, pname)
+            kwargs[pname] = defaults.get(pname, 15)
 
     # 实例化模型
     model = network_cls(**kwargs).to(device)
@@ -113,15 +103,6 @@ def _infer_network_from_checkpoint(ckpt: dict, device: torch.device):
     model.eval()
 
     return model
-
-
-def _get_default_param(arch_type: str, param_name: str):
-    """获取参数的默认值。"""
-    defaults = {
-        'cnn': {'num_res_blocks': 4, 'channels': 128, 'board_size': 15},
-        'transformer': {'d_model': 64, 'num_heads': 4, 'num_layers': 5, 'ff_expand': 4, 'dropout': 0.1, 'board_size': 15},
-    }
-    return defaults.get(arch_type, {}).get(param_name, 15)
 
 
 class AZAgent:

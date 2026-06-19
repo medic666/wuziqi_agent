@@ -18,7 +18,7 @@ import torch
 import torch.multiprocessing as mp
 import numpy as np
 import queue
-from agents.neural.network import ActorCriticNet
+from agents.neural.registry import get_network_class, get_defaults, resolve_arch, infer_arch_from_state_dict
 
 
 class InferenceServer:
@@ -75,15 +75,44 @@ class InferenceServer:
         device = torch.device(device_str)
         model = None
         try:
-            # 加载模型（自动推断架构）
+            # 加载模型（通过注册表自动推断架构）
             ckpt = torch.load(model_path, map_location=device, weights_only=False)
             state_dict = ckpt.get('model_state_dict', ckpt)
+            config = ckpt.get('model_config', {})
             
-            channels = state_dict['stem_conv.weight'].shape[0]
-            res_block_indices = [int(k.split('.')[1]) for k in state_dict if k.startswith('res_blocks.')]
-            num_blocks = max(res_block_indices) + 1 if res_block_indices else 4
-            
-            model = ActorCriticNet(num_res_blocks=num_blocks, channels=channels).to(device)
+            # 推断架构类型
+            arch_type = config.get('arch_type', None)
+            if arch_type is not None:
+                arch_type = resolve_arch(arch_type)
+            else:
+                arch_type = infer_arch_from_state_dict(state_dict)
+
+            network_cls = get_network_class(arch_type)
+            defaults = get_defaults(arch_type)
+
+            # 构造模型参数
+            kwargs = {**defaults}
+            for k in config:
+                if k != 'arch_type' and k in kwargs:
+                    kwargs[k] = config[k]
+
+            # CNN: 从权重推断未知参数
+            if arch_type in ('cnn_v2', 'cnn_v3'):
+                kwargs['channels'] = state_dict['stem_conv.weight'].shape[0]
+                res_block_indices = [
+                    int(k.split('.')[1]) for k in state_dict if k.startswith('res_blocks.')
+                ]
+                kwargs['num_res_blocks'] = max(res_block_indices) + 1 if res_block_indices else kwargs['num_res_blocks']
+
+            # Transformer: 从权重推断 d_model 和 num_layers
+            if arch_type == 'transformer':
+                kwargs['d_model'] = state_dict['embed.weight'].shape[0]
+                block_indices = [
+                    int(k.split('.')[1]) for k in state_dict if k.startswith('blocks.')
+                ]
+                kwargs['num_layers'] = max(block_indices) + 1 if block_indices else kwargs['num_layers']
+
+            model = network_cls(**kwargs).to(device)
             model.load_state_dict(state_dict)
             model.eval()
             
@@ -214,21 +243,49 @@ class DualInferenceServer:
         best_model, new_model = None, None
         
         try:
-            # 加载 best_model
+            # ── 加载 best_model ──
             best_ckpt = torch.load(best_model_path, map_location=device, weights_only=False)
             best_sd = best_ckpt.get('model_state_dict', best_ckpt)
-            channels = best_sd['stem_conv.weight'].shape[0]
-            res_block_indices = [int(k.split('.')[1]) for k in best_sd if k.startswith('res_blocks.')]
-            num_blocks = max(res_block_indices) + 1 if res_block_indices else 4
-            
-            best_model = ActorCriticNet(num_res_blocks=num_blocks, channels=channels).to(device)
+            best_config = best_ckpt.get('model_config', {})
+            best_arch = resolve_arch(best_config.get('arch_type', None) or infer_arch_from_state_dict(best_sd))
+            best_cls = get_network_class(best_arch)
+            best_defaults = get_defaults(best_arch)
+            best_kwargs = {**best_defaults}
+            for k in best_config:
+                if k != 'arch_type' and k in best_kwargs:
+                    best_kwargs[k] = best_config[k]
+            if best_arch in ('cnn_v2', 'cnn_v3'):
+                best_kwargs['channels'] = best_sd['stem_conv.weight'].shape[0]
+                idxs_b = [int(k.split('.')[1]) for k in best_sd if k.startswith('res_blocks.')]
+                best_kwargs['num_res_blocks'] = max(idxs_b) + 1 if idxs_b else best_kwargs['num_res_blocks']
+            if best_arch == 'transformer':
+                best_kwargs['d_model'] = best_sd['embed.weight'].shape[0]
+                idxs_b = [int(k.split('.')[1]) for k in best_sd if k.startswith('blocks.')]
+                best_kwargs['num_layers'] = max(idxs_b) + 1 if idxs_b else best_kwargs['num_layers']
+            best_model = best_cls(**best_kwargs).to(device)
             best_model.load_state_dict(best_sd)
             best_model.eval()
-            
-            # 加载 new_model
+
+            # ── 加载 new_model ──
             new_ckpt = torch.load(new_model_path, map_location=device, weights_only=False)
             new_sd = new_ckpt.get('model_state_dict', new_ckpt)
-            new_model = ActorCriticNet(num_res_blocks=num_blocks, channels=channels).to(device)
+            new_config = new_ckpt.get('model_config', {})
+            new_arch = resolve_arch(new_config.get('arch_type', None) or infer_arch_from_state_dict(new_sd))
+            new_cls = get_network_class(new_arch)
+            new_defaults = get_defaults(new_arch)
+            new_kwargs = {**new_defaults}
+            for k in new_config:
+                if k != 'arch_type' and k in new_kwargs:
+                    new_kwargs[k] = new_config[k]
+            if new_arch in ('cnn_v2', 'cnn_v3'):
+                new_kwargs['channels'] = new_sd['stem_conv.weight'].shape[0]
+                idxs_n = [int(k.split('.')[1]) for k in new_sd if k.startswith('res_blocks.')]
+                new_kwargs['num_res_blocks'] = max(idxs_n) + 1 if idxs_n else new_kwargs['num_res_blocks']
+            if new_arch == 'transformer':
+                new_kwargs['d_model'] = new_sd['embed.weight'].shape[0]
+                idxs_n = [int(k.split('.')[1]) for k in new_sd if k.startswith('blocks.')]
+                new_kwargs['num_layers'] = max(idxs_n) + 1 if idxs_n else new_kwargs['num_layers']
+            new_model = new_cls(**new_kwargs).to(device)
             new_model.load_state_dict(new_sd)
             new_model.eval()
             

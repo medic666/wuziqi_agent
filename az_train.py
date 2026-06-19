@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from core.gamerules import GameState, GomokuRules
-from agents.neural.network import ActorCriticNet
+from agents.neural.registry import get_network_class, get_defaults
 from search.mcts import MCTS, state_to_tensor, create_local_eval_fn
 from training.inference_server import InferenceServer, DualInferenceServer
 from training.replay_buffer import ReplayBuffer

@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm  # 导入进度条库
 
-from agents.neural.network import ActorCriticNet
+from agents.neural.registry import build_model_from_config
 from utils.transforms import transform_state, transform_2d  # 引入8向变换工具
 from training.config import TrainConfig
 
@@ -78,9 +78,7 @@ class JointTrainer:
         self.config = config
         self.device = self._get_device()
 
-        self.model = ActorCriticNet(
-            num_res_blocks=config.num_res_blocks, channels=config.channels, board_size=config.board_size
-        ).to(self.device)
+        self.model = build_model_from_config(config.arch_type, device=self.device)
         
         self.train_loader, self.val_loader = self._build_dataloaders()
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
@@ -301,7 +299,7 @@ class JointTrainer:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         saved_cfg = TrainConfig.from_dict(ckpt.get('config', {}))
         for p in ['num_res_blocks', 'channels', 'board_size']: setattr(self.config, p, getattr(saved_cfg, p))
-        self.model = ActorCriticNet(self.config.num_res_blocks, self.config.channels, self.config.board_size).to(self.device)
+        self.model = build_model_from_config(self.config.arch_type, device=self.device)
         self.model.load_state_dict(ckpt['model_state_dict']); self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         for s in self.optimizer.state.values():
             for k, v in s.items(): 
@@ -320,12 +318,15 @@ class JointTrainer:
 if __name__ == '__main__':
     # 重要：Windows下使用多进程DataLoader(num_workers>0)时，
     # 必须将执行代码放在 if __name__ == '__main__': 保护下，否则会报错！
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="五子棋联合预训练")
+    parser.add_argument('--arch', type=str, default='cnn_v3',
+                        choices=['cnn_v2', 'cnn_v3', 'transformer'],
+                        help='网络架构 (默认: cnn_v3)')
     parser.add_argument('--resume', action='store_true', default=False)
     parser.add_argument('--max_epochs', type=int, default=None)
     args = parser.parse_args()
     
-    config = TrainConfig()
+    config = TrainConfig(arch_type=args.arch)
     if args.max_epochs: config.max_epochs = args.max_epochs
     if args.resume: config.resume = True
     

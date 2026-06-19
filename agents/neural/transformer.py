@@ -15,6 +15,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from agents.neural.registry import register
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -157,6 +158,11 @@ class TransformerBlock(nn.Module):
 #  主模型：GoBangTransformer_v2（改进价值头 + 安全掩码）
 # ═══════════════════════════════════════════════════════════════
 
+@register(
+    arch_type='transformer',
+    param_names=['d_model', 'num_heads', 'num_layers', 'ff_expand', 'dropout', 'board_size'],
+    defaults={'d_model': 64, 'num_heads': 4, 'num_layers': 5, 'ff_expand': 4, 'dropout': 0.1, 'board_size': 15},
+)
 class GoBangTransformer_v2(nn.Module):
     """
     改进版 Transformer 五子棋网络。
@@ -245,18 +251,19 @@ class GoBangTransformer_v2(nn.Module):
         # 专门初始化 value_query 参数
         nn.init.xavier_uniform_(self.value_query)
 
-    def forward(self, x: torch.Tensor) -> tuple:
+    def forward(self, x: torch.Tensor, return_value_only: bool = False) -> tuple:
         """
         前向传播。
         Args:
             x: (B, 3, 15, 15)
+            return_value_only: 只返回价值（跳过策略头计算）
         Returns:
             (policy_logits, value): logits (B,225), value (B,)
+            若 return_value_only=True, policy_logits 为 None
         """
         B, C, H, W = x.shape
 
         # 占用掩码（嵌入前计算，保证准确）
-        # True 表示该位置已有棋子 (需被屏蔽)
         occupied_mask = (x[:, 0, :, :] + x[:, 1, :, :]).view(B, -1) > 0  # (B, 225)
 
         # 展平并嵌入
@@ -269,25 +276,21 @@ class GoBangTransformer_v2(nn.Module):
         for block in self.blocks:
             x = block(x)                                     # (B, 225, d_model)
 
-        # --- 策略头 ---
-        p = self.policy_head(x).squeeze(-1)                  # (B, 225)
-        # 安全掩码：使用 FP16 安全的负数代替 -inf
-        p = p.masked_fill(occupied_mask, self.mask_val)
-
         # --- 价值头（CLS 注意力池化）---
         query = self.value_query.expand(B, -1, -1)           # (B, 1, d_model)
-        
-        # ★ 修复 Bug：传入 key_padding_mask，屏蔽已占用位置，切断其梯度污染
         attn_out, _ = self.value_attn(
-            query=query,
-            key=x,
-            value=x,
-            key_padding_mask=occupied_mask
+            query=query, key=x, value=x, key_padding_mask=occupied_mask
         )                                                    # (B, 1, d_model)
-        
         value = self.value_mlp(attn_out.squeeze(1))          # (B, 1)
         value = value.squeeze(-1)                             # (B,)
         value = torch.tanh(value)                            # (B,) 范围 [-1, 1]
+
+        if return_value_only:
+            return None, value
+
+        # --- 策略头 ---
+        p = self.policy_head(x).squeeze(-1)                  # (B, 225)
+        p = p.masked_fill(occupied_mask, self.mask_val)
 
         return p, value
 

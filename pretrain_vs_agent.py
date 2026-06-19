@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from core.gamerules import GameState, GomokuRules
-from agents.neural.network import ActorCriticNet
+from agents.neural.registry import build_model_from_config
 from search.mcts import MCTS, state_to_tensor
 from training.inference_server import InferenceServer
 from training.replay_buffer import ReplayBuffer
@@ -248,7 +248,7 @@ class AgentPreTrainer:
     def __init__(self, config: PretrainConfig):
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = ActorCriticNet(config.num_res_blocks, config.channels, config.board_size).to(self.device)
+        self.model = build_model_from_config(config.arch_type, device=self.device)
         self.replay_buffer = ReplayBuffer(config.replay_buffer_size)
         self.value_loss_fn = nn.HuberLoss(delta=config.value_loss_delta)
         self._create_optimizer()
@@ -262,8 +262,12 @@ class AgentPreTrainer:
         self._print_header()
 
     def _create_optimizer(self):
-        decay = [p for n, p in self.model.named_parameters() if not ('bn' in n or 'bias' in n)]
-        no_decay = [p for n, p in self.model.named_parameters() if 'bn' in n or 'bias' in n]
+        if self.config.arch_type == 'transformer':
+            decay = [p for n, p in self.model.named_parameters() if not ('ln' in n or 'bias' in n or 'norm' in n)]
+            no_decay = [p for n, p in self.model.named_parameters() if 'ln' in n or 'bias' in n or 'norm' in n]
+        else:
+            decay = [p for n, p in self.model.named_parameters() if not ('bn' in n or 'bias' in n)]
+            no_decay = [p for n, p in self.model.named_parameters() if 'bn' in n or 'bias' in n]
         self.optimizer = torch.optim.AdamW([
             {'params': decay, 'weight_decay': self.config.weight_decay},
             {'params': no_decay, 'weight_decay': 0.0}
