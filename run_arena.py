@@ -30,12 +30,14 @@ ARCH_TO_PATH = {
 }
 
 
-def create_agent(spec: str, default_sims: int = 400):
+def create_agent(spec: str, default_sims: int = 400, mode: str = "mcts", nucleus_p: float = 0.6):
     """根据 spec 创建 Agent。
 
     Args:
         spec: 'rule_based' | 架构名 | 显式模型路径
-        default_sims: MCTS 模拟次数 (仅用于 AZAgent)
+        default_sims: MCTS 模拟次数 (仅用于 AZAgent MCTS 模式)
+        mode: 决策模式 "mcts" | "nucleus" (仅用于 AZAgent)
+        nucleus_p: 核采样 top-p 阈值 (仅用于 AZAgent nucleus 模式)
     """
     if spec == 'rule_based':
         return ADAgent(
@@ -57,10 +59,13 @@ def create_agent(spec: str, default_sims: int = 400):
         print(f"   可用架构名: {list(ARCH_TO_PATH.keys())}, rule_based")
         raise FileNotFoundError(f"模型文件不存在: {model_path}")
 
-    print(f"  加载 {agent_name}: {model_path}")
+    mode_str = f" | 模式: {mode}" + (f"({default_sims}sims)" if mode == "mcts" else f"(top-p={nucleus_p})")
+    print(f"  加载 {agent_name}: {model_path}{mode_str}")
     return AZAgent(
         model_path=model_path,
+        mode=mode,
         num_sims=default_sims,
+        nucleus_p=nucleus_p,
         temperature=0.0,
         dirichlet_epsilon=0.0,
         name=agent_name,
@@ -88,17 +93,30 @@ if __name__ == '__main__':
         help="白方 Agent: rule_based | cnn_v2 | cnn_v3 | transformer | /path/to/model.pt",
     )
     parser.add_argument(
+        '--agent1-mode', type=str, default='mcts', choices=['mcts', 'nucleus'],
+        help="黑方决策模式 (默认: mcts)",
+    )
+    parser.add_argument(
+        '--agent2-mode', type=str, default='mcts', choices=['mcts', 'nucleus'],
+        help="白方决策模式 (默认: mcts)",
+    )
+    parser.add_argument(
         '--sims', type=int, default=400,
-        help="MCTS 模拟次数 (默认: 400)",
+        help="MCTS 模拟次数 (默认: 400, 仅 MCTS 模式)",
+    )
+    parser.add_argument(
+        '--nucleus-p', type=float, default=0.6,
+        help="核采样 top-p 阈值 (默认: 0.6, 仅 nucleus 模式)",
     )
     args = parser.parse_args()
 
     print(f"\n{'='*50}")
     print(f"  竞技场: {args.agent1} (黑) vs {args.agent2} (白)")
-    print(f"  MCTS: {args.sims} 次模拟")
+    print(f"  黑方模式: {args.agent1_mode} | 白方模式: {args.agent2_mode}")
+    print(f"  MCTS: {args.sims} 次模拟 | 核采样 top-p: {args.nucleus_p}")
     print(f"{'='*50}\n")
 
-    agent_black = create_agent(args.agent1, args.sims)
-    agent_white = create_agent(args.agent2, args.sims)
+    agent_black = create_agent(args.agent1, args.sims, args.agent1_mode, args.nucleus_p)
+    agent_white = create_agent(args.agent2, args.sims, args.agent2_mode, args.nucleus_p)
 
     Arena(agent_black=agent_black, agent_white=agent_white)

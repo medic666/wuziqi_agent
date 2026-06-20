@@ -2,11 +2,12 @@
 """
 AlphaZero 神经网络智能体 (AZAgent)
 
-使用 MCTS + 神经网络进行决策。支持树复用：在连续走子间复用
-MCTS 搜索树，大幅减少重复计算。
+支持两种决策模式:
+  - mode="mcts":    MCTS 搜索 + 神经网络评估 (默认)
+  - mode="nucleus": 核采样：直接使用策略头输出进行 top-p 采样，无 MCTS
 
 关键设计:
-  - 树复用: 手动推进自己的走子 + search() 内部处理对手走子
+  - 树复用: 手动推进自己的走子 + search() 内部处理对手走子 (仅 MCTS 模式)
   - 模型加载: 自动推断网络架构（CNN vs Transformer），支持显式指定
   - 设备管理: 支持 auto/cuda/cpu 指定
   - 架构无关: 通过 network_cls 参数或 checkpoint 中的 arch_type 字段
@@ -19,7 +20,8 @@ import torch
 from typing import Tuple, Optional, Type
 from core.gamerules import GameState
 from agents.neural.registry import build_model_from_checkpoint
-from search.mcts import MCTS, create_local_eval_fn
+from search.mcts import MCTS, create_local_eval_fn, state_to_tensor
+from search.sampling import nucleus_sample_action
 
 
 def _infer_network_from_checkpoint(ckpt: dict, device: torch.device):
@@ -43,45 +45,32 @@ class AZAgent:
     """
     AlphaZero 神经网络智能体（架构无关）。
 
-    使用 MCTS + 神经网络进行决策。通过 new_game() 方法在新一局开始时重置搜索树。
+    支持两种决策模式:
+      - mode="mcts":    MCTS 搜索 + 神经网络评估 (默认)，支持树复用
+      - mode="nucleus": 核采样：直接使用策略头输出进行 top-p 采样，无 MCTS
 
-    支持 CNN (ActorCriticNet) 和 Transformer (GoBangTransformer_v2) 两种架构，
-    从 checkpoint 自动推断或通过 network_cls 显式指定。
-
-    典型用法 (CNN):
-        agent = AZAgent(
-            model_path="checkpoints/az_train/best_model.pt",
-            num_sims=400,
-            temperature=0.0,
-            name="AlphaZero_CNN",
-        )
-
-    典型用法 (Transformer):
-        agent = AZAgent(
-            model_path="checkpoints/transformer_train/best_model.pt",
-            num_sims=400,
-            temperature=0.0,
-            name="AlphaZero_Transformer",
-        )
+    通过 new_game() 方法在新一局开始时重置搜索树（仅 MCTS 模式）。
 
     Args:
         model_path: 模型权重文件路径 (.pt)
-        num_sims: MCTS 模拟次数
-        c_puct: PUCT 探索参数
-        temperature: 温度参数 (0=确定性选最大访问数)
-        dirichlet_alpha: Dirichlet 噪声 alpha
-        dirichlet_epsilon: Dirichlet 噪声混合比例 (0=不加噪声)
+        mode: 决策模式 "mcts" | "nucleus"
+        num_sims: MCTS 模拟次数 (仅 MCTS 模式)
+        c_puct: PUCT 探索参数 (仅 MCTS 模式)
+        temperature: 温度参数 (0=确定性; MCTS 模式控制 visit softmax, nucleus 模式控制概率缩放)
+        dirichlet_alpha: Dirichlet 噪声 alpha (仅 MCTS 模式)
+        dirichlet_epsilon: Dirichlet 噪声混合比例 (仅 MCTS 模式)
         candidate_radius: 候选着法搜索半径
-        advantage_clip: 优势值裁剪范围 [-clip, clip]
+        advantage_clip: 优势值裁剪范围 (仅 MCTS 模式)
+        nucleus_p: 核采样 top-p 阈值 (仅 nucleus 模式)
         name: 智能体名称（用于竞技场显示）
         device: 计算设备 ("auto"/"cuda"/"cpu")
-        network_cls: 显式指定网络类（None=自动从checkpoint推断）。
-                     用于强制指定架构，例如竞技场中CNN vs Transformer对战。
+        network_cls: 显式指定网络类（None=自动从checkpoint推断）
     """
 
     def __init__(
         self,
         model_path: str,
+        mode: str = "mcts",
         num_sims: int = 400,
         c_puct: float = 2.5,
         temperature: float = 0.0,
@@ -89,12 +78,16 @@ class AZAgent:
         dirichlet_epsilon: float = 0.0,
         candidate_radius: int = 3,
         advantage_clip: float = 1.0,
+        nucleus_p: float = 0.6,
         name: str = "AlphaZero",
         device: str = "auto",
         network_cls: Optional[Type] = None,
     ):
         self.name = name
+        self.mode = mode
         self.temperature = temperature
+        self.nucleus_p = nucleus_p
+        self.candidate_radius = candidate_radius
 
         # ── 确定计算设备 ──
         if device == "auto":
@@ -106,75 +99,98 @@ class AZAgent:
         ckpt = torch.load(model_path, map_location=self.device, weights_only=False)
 
         if network_cls is not None:
-            # 显式指定网络类：使用 checkpoint 中的 config 构造
             state_dict = ckpt.get('model_state_dict', ckpt)
             config = ckpt.get('model_config', {})
             self.model = network_cls(**config).to(self.device)
             self.model.load_state_dict(state_dict)
             self.model.eval()
         else:
-            # 自动推断架构
             self.model = _infer_network_from_checkpoint(ckpt, self.device)
 
         # CUDA 优化
         if self.device.type == 'cuda':
             torch.backends.cudnn.benchmark = True
 
-        # ── 创建 MCTS ──
-        eval_fn = create_local_eval_fn(self.model, self.device)
-        self.mcts = MCTS(
-            eval_fn=eval_fn,
-            c_puct=c_puct,
-            num_simulations=num_sims,
-            dirichlet_alpha=dirichlet_alpha,
-            dirichlet_epsilon=dirichlet_epsilon,
-            candidate_radius=candidate_radius,
-            advantage_clip=advantage_clip,
-        )
+        # ── 共享推理接口 ──
+        self._eval_fn = create_local_eval_fn(self.model, self.device)
 
-        # 树复用状态
+        # ── 按模式创建决策组件 ──
+        if mode == "mcts":
+            self.mcts = MCTS(
+                eval_fn=self._eval_fn,
+                c_puct=c_puct,
+                num_simulations=num_sims,
+                dirichlet_alpha=dirichlet_alpha,
+                dirichlet_epsilon=dirichlet_epsilon,
+                candidate_radius=candidate_radius,
+                advantage_clip=advantage_clip,
+            )
+        else:
+            self.mcts = None
+
         self._my_last_action = None
 
     def new_game(self):
         """
         新一局开始时调用，重置搜索树和记录。
-
-        遵循 Agent 生命周期管理约定。
+        nucleus 模式下无操作。
         """
-        self.mcts.root = None
         self._my_last_action = None
+        if self.mcts is not None:
+            self.mcts.root = None
 
     def get_move(self, state: GameState) -> Tuple[int, int]:
         """
-        选择落子，支持 MCTS 树复用。
+        选择落子。按 mode 分发到 MCTS 搜索或核采样。
 
-        树复用逻辑:
-          1. 先推进过自己上一步的子节点（手动推进）
-          2. 再通过 search(last_action=对手上一步) 推进过对手的子节点
-          3. 在复用后的子树上继续搜索，避免每步从零开始
-
-        Args:
-            state: 当前游戏状态
-
-        Returns:
-            (行, 列) 落子坐标
+        MCTS 模式: 树复用 → 搜索 → 返回最佳着法
+        nucleus 模式: 网络推理 → 核采样 → 返回着法
         """
-        # 步骤1: 推进过自己上一步
-        #   搜索结束后，root 的 children 包含自己的候选动作
-        #   推进到实际选择的那步，其 children 就是对手的候选响应
+        if self.mode == "nucleus":
+            return self._get_move_nucleus(state)
+        return self._get_move_mcts(state)
+
+    def _get_move_mcts(self, state: GameState) -> Tuple[int, int]:
+        """MCTS 搜索 + 树复用"""
         if self._my_last_action is not None and self.mcts.root is not None:
             if self._my_last_action in self.mcts.root.children:
                 child = self.mcts.root.children[self._my_last_action]
-                child.parent = None  # 切断反向传播链接，防止内存泄漏
+                child.parent = None
                 self.mcts.root = child
             else:
                 self.mcts.root = None
 
-        # 步骤2: search 内部通过 last_action 推进过对手上一步，并在复用子树上搜索
-        #   state.last_move 就是对手的落子，传给 search 实现自动树复用
         _, action, _ = self.mcts.search(
             state, temperature=self.temperature, last_action=state.last_move
         )
 
         self._my_last_action = action
         return action
+
+    def _get_move_nucleus(self, state: GameState) -> Tuple[int, int]:
+        """核采样：直接策略头输出 + top-p 采样"""
+        state_tensor = state_to_tensor(state)
+        policy_probs, _ = self._eval_fn(state_tensor)
+        return nucleus_sample_action(
+            state, policy_probs, self.nucleus_p,
+            self.temperature, self.candidate_radius
+        )
+
+    def get_hint_move(self, state: GameState) -> Tuple[int, int]:
+        """
+        返回推荐的着法，不修改智能体内部状态（用于 UI 提示等场景）。
+
+        MCTS 模式: 临时运行 MCTS 搜索 (不干扰游戏树)
+        nucleus 模式: 策略头 argmax
+        """
+        if self.mode == "nucleus":
+            state_tensor = state_to_tensor(state)
+            policy_probs, _ = self._eval_fn(state_tensor)
+            return nucleus_sample_action(
+                state, policy_probs, self.nucleus_p, 0.0, self.candidate_radius
+            )
+        else:
+            saved_root = self.mcts.root
+            _, action, _ = self.mcts.search(state, temperature=0.0, last_action=None)
+            self.mcts.root = saved_root
+            return action

@@ -56,20 +56,22 @@ class AlphaZeroConfig:
         c_puct: float = 2.5,                     # PUCT 探索常数
         dirichlet_alpha: float = 0.2,            # Dirichlet 噪声 alpha
         dirichlet_epsilon: float = 0.25,         # Dirichlet 噪声混合比例
-        temp_threshold: int = 60,                # 温度阈值（步数）
+        temp_threshold: int = 4,                 # 温度阈值（步数）
         candidate_radius: int = 2,               # 候选着法半径
         advantage_clip: float = 1.0,             # 优势裁剪范围
         # ── 竞技场参数 ──
         arena_win_threshold: float = 0.6,        # 模型更新阈值
-        arena_num_sims: int = 400,               # 竞技场 MCTS 模拟次数
-        arena_c_puct: float = 2.5,               # 竞技场 PUCT
-        arena_dirichlet_alpha: float = 0.2,      # 竞技场 Dirichlet alpha
-        arena_dirichlet_epsilon: float = 0.0,    # 竞技场 Dirichlet 噪声（通常关）
-        arena_temperature: float = 1e-3,         # 竞技场温度（接近确定性）
-        arena_temp_threshold: int = 4,           # 竞技场温度阈值
         arena_collapse_threshold: float = 0.35,  # 坍塌检测阈值
         arena_save_image_every_n_games: int = 5, # 竞技场图片保存间隔
-        arena_data_to_buffer: bool = True,       # 竞技场数据是否加入缓冲区
+        # 核采样参数（竞技场无 MCTS，直接策略头核采样）
+        arena_nucleus_p: float = 0.6,            # 核采样 top-p 累积概率阈值
+        arena_nucleus_temp_threshold: int = 4,   # 开局高温步数阈值
+        arena_nucleus_early_temp: float = 1.5,   # 开局温度（>1 使分布更平坦，开局更丰富）
+        # 竞技场 MCTS 参数（已废弃，仅 _evaluate_baseline 仍使用）
+        arena_c_puct: float = 2.5,               # 基准评估 PUCT
+        arena_dirichlet_alpha: float = 0.2,      # 基准评估 Dirichlet alpha
+        arena_dirichlet_epsilon: float = 0.0,    # 基准评估 Dirichlet 噪声
+        arena_temperature: float = 1e-3,         # 基准评估温度
         # ── 基准评估参数 ──
         baseline_num_sims: int = 400,            # 基准评估 MCTS 模拟次数
         baseline_agent_depth: int = 4,           # 基准 Agent 搜索深度

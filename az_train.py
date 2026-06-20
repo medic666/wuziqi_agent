@@ -1,7 +1,7 @@
 # az_train.py
 """
 五子棋 AlphaZero 训练主循环
-(改进版v9.6: 优势裁剪 + HuberLoss + Cosine LR/Warmup + 两阶段安全存档 + 竞技场/基准评估完美树复用 + 竞技场双模型并发推理
+(改进版v10: 优势裁剪 + HuberLoss + Cosine LR/Warmup + 两阶段安全存档 + 竞技场核采样(无MCTS) + 基准评估MCTS + 双模型并发推理
  + 【修复】ReplayBuffer线性化错位 + 【修复】Collapse脏数据回退 + 【优化】续训/初始化逻辑 + 【优化】原子化存档 + 【修复】NumPy比较警告)
 """
 
@@ -25,6 +25,7 @@ from tqdm import tqdm
 from core.gamerules import GameState, GomokuRules
 from agents.neural.registry import build_model_from_config, build_model_from_checkpoint
 from search.mcts import MCTS, state_to_tensor, create_local_eval_fn
+from search.sampling import nucleus_sample_action
 from training.inference_server import InferenceServer, DualInferenceServer
 from training.replay_buffer import ReplayBuffer
 from training.config import AlphaZeroConfig
@@ -117,34 +118,7 @@ def worker_loop(
 def arena_worker_loop(
     worker_id, request_queue, result_queue, task_queue, output_queue, config
 ):
-    """★ 竞技场并发 Worker (自带完美树复用)"""
-    def make_eval_fn(model_id):
-        def eval_fn(state_np):
-            request_queue.put((worker_id, model_id, state_np))
-            try:
-                res = result_queue.get(timeout=30)
-                # ★ 修复 FutureWarning: 增加长度判断，避免 numpy array 与 string 的比较
-                if isinstance(res, tuple) and len(res) == 3 and res[0] == "FATAL_INIT":
-                    raise RuntimeError("竞技场推理服务器初始化失败")
-                policy, value = res
-            except queue.Empty:
-                raise RuntimeError("竞技场推理服务器超时")
-            if policy is None:
-                raise RuntimeError("竞技场推理服务器返回异常")
-            return policy, value
-        return eval_fn
-
-    new_mcts = MCTS(
-        eval_fn=make_eval_fn(1), c_puct=config.arena_c_puct, num_simulations=config.arena_num_sims,
-        dirichlet_alpha=config.arena_dirichlet_alpha, dirichlet_epsilon=config.arena_dirichlet_epsilon,
-        candidate_radius=config.candidate_radius, advantage_clip=config.advantage_clip,
-    )
-    best_mcts = MCTS(
-        eval_fn=make_eval_fn(0), c_puct=config.arena_c_puct, num_simulations=config.arena_num_sims,
-        dirichlet_alpha=config.arena_dirichlet_alpha, dirichlet_epsilon=config.arena_dirichlet_epsilon,
-        candidate_radius=config.candidate_radius, advantage_clip=config.advantage_clip,
-    )
-
+    """竞技场 Worker (核采样版，无 MCTS)"""
     while True:
         try:
             task = task_queue.get(timeout=5)
@@ -152,50 +126,46 @@ def arena_worker_loop(
             break
         if task is None:
             break
-            
+
         game_idx = task
         try:
             state = GameState(board=bytearray(BOARD_SQUARES), current_player=1, history=[], last_move=None)
             new_is_black = (game_idx % 2 == 0)
-            
-            new_mcts.root = None
-            best_mcts.root = None
-            last_action_for_new = None
-            last_action_for_best = None
-            
-            game_data = []
-            
+
             while True:
                 is_new_turn = (state.current_player == 1) == new_is_black
-                current_mcts = new_mcts if is_new_turn else best_mcts
-                current_last_action = last_action_for_new if is_new_turn else last_action_for_best
+                model_id = 1 if is_new_turn else 0
+
+                state_tensor = state_to_tensor(state)
+                request_queue.put((worker_id, model_id, state_tensor))
+                try:
+                    res = result_queue.get(timeout=30)
+                    if isinstance(res, tuple) and len(res) == 3 and res[0] == "FATAL_INIT":
+                        raise RuntimeError("竞技场推理服务器初始化失败")
+                    policy_probs, _ = res
+                except queue.Empty:
+                    raise RuntimeError("竞技场推理服务器超时")
+                if policy_probs is None:
+                    raise RuntimeError("竞技场推理服务器返回异常")
 
                 move_count = len(state.history)
-                temperature = 1.0 if move_count < config.arena_temp_threshold else config.arena_temperature
-                
-                mcts_policy, action, advantages = current_mcts.search(
-                    state, temperature=temperature, last_action=current_last_action
+                if move_count < config.arena_nucleus_temp_threshold:
+                    temperature = config.arena_nucleus_early_temp
+                else:
+                    temperature = 1.0
+
+                action = nucleus_sample_action(
+                    state, policy_probs, config.arena_nucleus_p,
+                    temperature, config.candidate_radius
                 )
-                game_data.append((state_to_tensor(state), mcts_policy, advantages, state.current_player))
-
-                if is_new_turn:
-                    last_action_for_best = action
-                else:
-                    last_action_for_new = action
-
-                if current_mcts.root is not None and action in current_mcts.root.children:
-                    child = current_mcts.root.children[action]
-                    child.parent = None
-                    current_mcts.root = child
-                else:
-                    current_mcts.root = None
 
                 GomokuRules.apply_move_fast(state, action)
                 winner = GomokuRules.check_winner(state)
-                if winner is not None: break
-            
-            output_queue.put((winner, new_is_black, game_data, list(state.history)))
-            
+                if winner is not None:
+                    break
+
+            output_queue.put((winner, new_is_black, list(state.history)))
+
         except Exception as e:
             logger.error(f"Arena Worker {worker_id} 游戏 {game_idx} 出错: {e}")
             output_queue.put(None)
@@ -505,7 +475,7 @@ class AlphaZeroTrainer:
         logger.info("=" * 70)
         logger.info(f"  网络: {c.num_res_blocks} Blocks × {c.channels} Ch | 参数量: {total_p:,}")
         logger.info(f"  自弈: {c.games_per_iteration}局/轮 × {c.num_sims}次模拟")
-        logger.info(f"  竞技场: {c.arena_games}局(★并发) × {c.arena_num_sims}次模拟 | 树复用: ON")
+        logger.info(f"  竞技场: {c.arena_games}局(★并发) | 核采样(top-p={c.arena_nucleus_p}, 开局T={c.arena_nucleus_early_temp}×{c.arena_nucleus_temp_threshold}步)")
         logger.info("=" * 70)
 
     def _train_step(self, states, policies, values, advantages):
@@ -582,7 +552,7 @@ class AlphaZeroTrainer:
             'valid_steps': valid_steps,
         }
 
-    def _arena_phase(self, iteration: int) -> Tuple[bool, list, float]:
+    def _arena_phase(self, iteration: int) -> Tuple[bool, float]:
         logger.info(f"  竞技场: 新模型 vs 最佳模型 ({self.config.arena_games} 局 ★并发)")
         
         new_model_path = os.path.join(self.config.checkpoint_dir, 'new_model_arena.pt')
@@ -605,7 +575,7 @@ class AlphaZeroTrainer:
             logger.error("  双模型推理服务器初始化失败，跳过竞技场")
             server.shutdown()
             if os.path.exists(new_model_path): os.remove(new_model_path)
-            return False, [], 0.0
+            return False, 0.0
             
         logger.info("  双模型推理服务器已就绪")
 
@@ -628,7 +598,6 @@ class AlphaZeroTrainer:
             processes.append(p)
 
         new_wins, best_wins, draws = 0, 0, 0
-        all_arena_samples = []
         games_completed = 0
         workers_done = 0
         
@@ -656,7 +625,7 @@ class AlphaZeroTrainer:
                 pbar.update(1)
                 continue
                 
-            winner, new_is_black, game_data, history = result
+            winner, new_is_black, history = result
             
             if winner == 0: 
                 draws += 1
@@ -664,10 +633,6 @@ class AlphaZeroTrainer:
                 new_wins += 1
             else: 
                 best_wins += 1
-                
-            for s, p, adv, player in game_data:
-                value = 0.0 if winner == 0 else (1.0 if winner == player else -1.0)
-                all_arena_samples.append((s, p, value, adv))
 
             games_completed += 1
             if games_completed % self.config.arena_save_image_every_n_games == 0:
@@ -697,7 +662,7 @@ class AlphaZeroTrainer:
         })
         
         is_best = win_rate >= self.config.arena_win_threshold
-        return is_best, all_arena_samples, win_rate
+        return is_best, win_rate
 
     def _evaluate_baseline(self, iteration: int):
         try:
@@ -854,24 +819,16 @@ class AlphaZeroTrainer:
             if self.current_phase < 3:
                 if len(self.replay_buffer) >= self.config.min_replay_size:
                     logger.info("[阶段3] 竞技场评估...")
-                    is_best, arena_samples, arena_win_rate = self._arena_phase(iteration)
+                    is_best, arena_win_rate = self._arena_phase(iteration)
 
                     is_collapse = not is_best and arena_win_rate < self.config.arena_collapse_threshold
 
                     if is_collapse:
                         logger.warning(f"  ⚠️ 竞技场胜率极低({arena_win_rate:.1%} < {self.config.arena_collapse_threshold:.0%})，"
-                                       "丢弃竞技场数据并紧急回退到最佳模型！")
+                                        "紧急回退到最佳模型！")
                         self.new_model.load_state_dict(self.best_model.state_dict())
                         self._reset_optimizer()
                     else:
-                        if self.config.arena_data_to_buffer and arena_samples:
-                            a_states = np.array([s[0] for s in arena_samples], dtype=np.float32)
-                            a_policies = np.array([s[1] for s in arena_samples], dtype=np.float32)
-                            a_values = np.array([s[2] for s in arena_samples], dtype=np.float32)
-                            a_advantages = np.array([s[3] for s in arena_samples], dtype=np.float32)
-                            self.replay_buffer.add(a_states, a_policies, a_values, a_advantages)
-                            logger.info(f"  ✓ 竞技场数据已加入缓冲区: +{len(arena_samples)} 样本 | 缓冲区总计 {len(self.replay_buffer):,}")
-
                         if is_best:
                             self.best_model.load_state_dict(self.new_model.state_dict())
                             history_dir = os.path.join(self.config.checkpoint_dir, "history_best_models")
