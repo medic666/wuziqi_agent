@@ -1,7 +1,7 @@
 # az_train.py
 """
 五子棋 AlphaZero 训练主循环
-(改进版v10: 优势裁剪 + HuberLoss + Cosine LR/Warmup + 两阶段安全存档 + 竞技场核采样(无MCTS) + 基准评估MCTS + 双模型并发推理
+(改进版v10: 优势裁剪 + HuberLoss + Cosine LR/Warmup + 两阶段安全存档 + 竞技场核采样(无MCTS) + 基准评估核采样(无MCTS) + 双模型并发推理
  + 【修复】ReplayBuffer线性化错位 + 【修复】Collapse脏数据回退 + 【优化】续训/初始化逻辑 + 【优化】原子化存档 + 【修复】NumPy比较警告)
 """
 
@@ -175,11 +175,11 @@ def arena_worker_loop(
 
 def baseline_eval_worker(
     worker_id, request_queue, result_queue, task_queue, output_queue,
-    baseline_num_sims, arena_c_puct, arena_dirichlet_alpha, arena_dirichlet_epsilon,
-    candidate_radius, advantage_clip, arena_temperature,
+    candidate_radius,
+    baseline_nucleus_p, baseline_nucleus_temp_threshold, baseline_nucleus_early_temp,
     agent_depth, agent_max_candidates
 ):
-    """基准评估 Worker"""
+    """基准评估 Worker (核采样版，无 MCTS)"""
     try:
         from agents.rule_based import ADAgent as AgentAD
     except ImportError:
@@ -187,22 +187,6 @@ def baseline_eval_worker(
         return
 
     agent = AgentAD(depth=agent_depth, max_candidates=agent_max_candidates, name="RuleBaseline")
-    
-    def server_eval_fn(state_np):
-        request_queue.put((worker_id, state_np))
-        try:
-            policy, value = result_queue.get(timeout=60)
-        except queue.Empty:
-            raise RuntimeError("推理服务器超时(60s)")
-        if policy is None:
-            raise RuntimeError("推理服务器返回异常")
-        return policy, value
-
-    mcts = MCTS(
-        eval_fn=server_eval_fn, c_puct=arena_c_puct, num_simulations=baseline_num_sims,
-        dirichlet_alpha=arena_dirichlet_alpha, dirichlet_epsilon=arena_dirichlet_epsilon,
-        candidate_radius=candidate_radius, advantage_clip=advantage_clip,
-    )
 
     while True:
         try:
@@ -211,49 +195,49 @@ def baseline_eval_worker(
             break
         if task is None:
             break
-            
+
         game_idx = task
         try:
             state = GameState(board=bytearray(BOARD_SQUARES), current_player=1, history=[], last_move=None)
             az_is_black = (game_idx % 2 == 0)
             az_player = 1 if az_is_black else 2
-            
+
             if hasattr(agent, '_chosen_opening'): agent._chosen_opening = None
             if hasattr(agent, '_opening_step'): agent._opening_step = 0
             if hasattr(agent, 'reset_incremental_cache'): agent.reset_incremental_cache()
-            
-            mcts.root = None
-            last_az_action = None
-            last_opp_action = None
-            
+
             while True:
                 is_az_turn = (state.current_player == az_player)
                 if is_az_turn:
-                    mcts_policy, action, advantages = mcts.search(state, temperature=arena_temperature, last_action=last_opp_action)
-                    last_az_action = action
-                    if mcts.root is not None and action in mcts.root.children:
-                        child = mcts.root.children[action]
-                        child.parent = None
-                        mcts.root = child
+                    state_tensor = state_to_tensor(state)
+                    request_queue.put((worker_id, state_tensor))
+                    try:
+                        policy_probs, _ = result_queue.get(timeout=60)
+                    except queue.Empty:
+                        raise RuntimeError("基准评估推理服务器超时(60s)")
+                    if policy_probs is None:
+                        raise RuntimeError("基准评估推理服务器返回异常")
+
+                    move_count = len(state.history)
+                    if move_count < baseline_nucleus_temp_threshold:
+                        temperature = baseline_nucleus_early_temp
                     else:
-                        mcts.root = None
+                        temperature = 1.0
+
+                    action = nucleus_sample_action(
+                        state, policy_probs, baseline_nucleus_p,
+                        temperature, candidate_radius
+                    )
                 else:
                     action = agent.get_move(state)
-                    last_opp_action = action
-                    if mcts.root is not None and action in mcts.root.children:
-                        child = mcts.root.children[action]
-                        child.parent = None
-                        mcts.root = child
-                    else:
-                        mcts.root = None
-                        
+
                 GomokuRules.apply_move_fast(state, action)
                 winner = GomokuRules.check_winner(state)
                 if winner is not None:
                     break
-            
+
             output_queue.put((winner, az_player))
-            
+
         except Exception as e:
             logger.error(f"Eval Worker {worker_id} 游戏 {game_idx} 出错: {e}")
             output_queue.put(None)
@@ -690,9 +674,8 @@ class AlphaZeroTrainer:
                 req_q, res_q = eval_queues[i]
                 p = mp.Process(target=baseline_eval_worker, args=(
                     i, req_q, res_q, task_queue, output_queue,
-                    self.config.baseline_num_sims, self.config.arena_c_puct, 
-                    self.config.arena_dirichlet_alpha, self.config.arena_dirichlet_epsilon,
-                    self.config.candidate_radius, self.config.advantage_clip, self.config.arena_temperature,
+                    self.config.candidate_radius,
+                    self.config.baseline_nucleus_p, self.config.baseline_nucleus_temp_threshold, self.config.baseline_nucleus_early_temp,
                     self.config.baseline_agent_depth, self.config.baseline_agent_max_candidates
                 ), daemon=True)
                 p.start()

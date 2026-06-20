@@ -67,15 +67,19 @@ class AlphaZeroConfig:
         arena_nucleus_p: float = 0.6,            # 核采样 top-p 累积概率阈值
         arena_nucleus_temp_threshold: int = 4,   # 开局高温步数阈值
         arena_nucleus_early_temp: float = 1.5,   # 开局温度（>1 使分布更平坦，开局更丰富）
-        # 竞技场 MCTS 参数（已废弃，仅 _evaluate_baseline 仍使用）
-        arena_c_puct: float = 2.5,               # 基准评估 PUCT
-        arena_dirichlet_alpha: float = 0.2,      # 基准评估 Dirichlet alpha
-        arena_dirichlet_epsilon: float = 0.0,    # 基准评估 Dirichlet 噪声
-        arena_temperature: float = 1e-3,         # 基准评估温度
+        # 竞技场 MCTS 参数（已废弃，核采样化后不再使用）
+        arena_c_puct: float = 2.5,               # [deprecated]
+        arena_dirichlet_alpha: float = 0.2,      # [deprecated]
+        arena_dirichlet_epsilon: float = 0.0,    # [deprecated]
+        arena_temperature: float = 1e-3,         # [deprecated]
         # ── 基准评估参数 ──
-        baseline_num_sims: int = 400,            # 基准评估 MCTS 模拟次数
+        baseline_num_sims: int = 400,            # [deprecated] 基准评估 MCTS 模拟次数（核采样化后废弃）
         baseline_agent_depth: int = 4,           # 基准 Agent 搜索深度
         baseline_agent_max_candidates: int = 10, # 基准 Agent 候选数
+        # 基准评估核采样参数（无 MCTS，直接策略头核采样）
+        baseline_nucleus_p: float = 0.6,            # 基准评估核采样 top-p 阈值
+        baseline_nucleus_temp_threshold: int = 4,   # 基准评估开局高温步数阈值
+        baseline_nucleus_early_temp: float = 1.5,   # 基准评估开局温度
         # ── 训练参数 ──
         replay_buffer_size: int = 500000,        # 回放缓冲区容量
         min_replay_size: int = 5000,             # 最小训练样本数
