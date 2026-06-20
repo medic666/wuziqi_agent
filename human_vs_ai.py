@@ -166,15 +166,19 @@ class HumanVsAIArena:
             side=tk.LEFT, padx=8
         )
 
-        # AI 模拟次数
+        # AI 模拟次数 (仅 MCTS 模式)
         sf = ttk.Frame(ctrl)
         sf.pack(fill=tk.X, padx=5, pady=5)
         ttk.Label(sf, text="AI模拟:").pack(side=tk.LEFT)
-        self.sims_var = tk.IntVar(value=self.ai_agent.mcts.num_simulations)
-        ttk.Spinbox(
+        default_sims = self.ai_agent.mcts.num_simulations if self.ai_agent.mcts is not None else 400
+        self.sims_var = tk.IntVar(value=default_sims)
+        self.sims_spinbox = ttk.Spinbox(
             sf, from_=50, to=2000, increment=50,
             textvariable=self.sims_var, width=6,
-        ).pack(side=tk.LEFT, padx=5)
+        )
+        self.sims_spinbox.pack(side=tk.LEFT, padx=5)
+        if self.ai_agent.mode == "nucleus":
+            self.sims_spinbox.config(state='disabled')
 
         # 历史记录
         hlf = ttk.LabelFrame(rp, text="历史记录")
@@ -348,7 +352,7 @@ class HumanVsAIArena:
 
         try:
             new_sims = self.sims_var.get()
-            if new_sims > 0:
+            if new_sims > 0 and self.ai_agent.mcts is not None:
                 self.ai_agent.mcts.num_simulations = new_sims
         except (tk.TclError, ValueError):
             pass
@@ -529,11 +533,7 @@ class HumanVsAIArena:
         self.turn_var.set("💡 计算提示中...")
 
         def worker():
-            saved_root = self.ai_agent.mcts.root
-            saved_last = self.ai_agent._my_last_action
-            move = self.ai_agent.get_move(self.state)
-            self.ai_agent.mcts.root = saved_root
-            self.ai_agent._my_last_action = saved_last
+            move = self.ai_agent.get_hint_move(self.state)
             if self.game_running and self.waiting_for_human:
                 self.root.after(0, self._show_hint, move)
 
@@ -715,8 +715,16 @@ if __name__ == "__main__":
         help="模型路径 (默认: checkpoints/az_train/best_model.pt)",
     )
     parser.add_argument(
+        "--mode", type=str, default="mcts", choices=["mcts", "nucleus"],
+        help="决策模式: mcts (MCTS搜索) | nucleus (核采样) (默认: mcts)",
+    )
+    parser.add_argument(
         "--sims", type=int, default=400,
-        help="MCTS 模拟次数 (默认: 400, 越大越强但越慢)",
+        help="MCTS 模拟次数 (仅 MCTS 模式, 默认: 400)",
+    )
+    parser.add_argument(
+        "--nucleus-p", type=float, default=0.6,
+        help="核采样 top-p 阈值 (仅 nucleus 模式, 默认: 0.6)",
     )
     parser.add_argument(
         "--color", type=int, default=1, choices=[1, 2],
@@ -725,11 +733,17 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     print(f"加载模型: {args.model}")
-    print(f"MCTS 模拟次数: {args.sims}")
+    print(f"决策模式: {args.mode}")
+    if args.mode == "mcts":
+        print(f"MCTS 模拟次数: {args.sims}")
+    else:
+        print(f"核采样 top-p: {args.nucleus_p}")
 
     ai = AZAgent(
         model_path=args.model,
+        mode=args.mode,
         num_sims=args.sims,
+        nucleus_p=args.nucleus_p,
         temperature=0.0,
         dirichlet_epsilon=0.0,
         name="AlphaZero",
