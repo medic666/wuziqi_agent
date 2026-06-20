@@ -92,7 +92,7 @@ class AlphaZeroConfig:
         checkpoint_dir: str = "checkpoints/az_train",
         save_interval: int = 1,                  # 存档间隔（迭代）
         save_replay_interval: int = 1,           # 回放缓冲区存档间隔
-        save_image_every_n_games: int = 50,      # 图片保存间隔
+        save_image_every_n_games: int = 10,      # 图片保存间隔
         # ── 设备 ──
         device: str = "auto",
         initial_model: Optional[str] = "checkpoints/joint_pretrain/best_model.pt",
