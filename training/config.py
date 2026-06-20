@@ -47,10 +47,10 @@ class AlphaZeroConfig:
         arch_params: dict = None,                 # 架构参数覆盖 (None=使用注册表默认值)
         # ── 训练循环 ──
         num_iterations: int = 200,              # 总迭代次数
-        games_per_iteration: int = 200,          # 每轮自对弈局数
-        train_steps_per_iteration: int = 80,     # 每轮训练步数
-        baseline_eval_games: int = 40,           # 基准评估局数
-        arena_games: int = 50,                   # 竞技场局数
+        games_per_iteration: int = 400,          # 每轮自对弈局数
+        train_steps_per_iteration: int = 160,     # 每轮训练步数
+        baseline_eval_games: int = 100,           # 基准评估局数
+        arena_games: int = 100,                   # 竞技场局数
         # ── MCTS 自对弈参数 ──
         num_sims: int = 400,                     # MCTS 模拟次数
         c_puct: float = 2.5,                     # PUCT 探索常数
@@ -62,7 +62,7 @@ class AlphaZeroConfig:
         # ── 竞技场参数 ──
         arena_win_threshold: float = 0.6,        # 模型更新阈值
         arena_collapse_threshold: float = 0.35,  # 坍塌检测阈值
-        arena_save_image_every_n_games: int = 5, # 竞技场图片保存间隔
+        arena_save_image_every_n_games: int = 10, # 竞技场图片保存间隔
         # 核采样参数（竞技场无 MCTS，直接策略头核采样）
         arena_nucleus_p: float = 0.6,            # 核采样 top-p 累积概率阈值
         arena_nucleus_temp_threshold: int = 4,   # 开局高温步数阈值
