@@ -508,9 +508,9 @@ class AlphaZeroTrainer:
             pg['lr'] = new_lr
 
         buffer_samples = len(self.replay_buffer)
-        max_steps = buffer_samples // self.config.batch_size // 2
+        max_steps = 8 * buffer_samples // self.config.batch_size // 2
         steps = min(self.config.train_steps_per_iteration, max_steps)
-        steps = max(steps, 20)
+        steps = max(steps, 160)
 
         total_loss = total_policy = total_value = 0.0
         valid_steps = 0

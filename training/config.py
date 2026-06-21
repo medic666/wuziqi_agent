@@ -47,26 +47,26 @@ class AlphaZeroConfig:
         arch_params: dict = None,                 # 架构参数覆盖 (None=使用注册表默认值)
         # ── 训练循环 ──
         num_iterations: int = 200,              # 总迭代次数
-        games_per_iteration: int = 400,          # 每轮自对弈局数
-        train_steps_per_iteration: int = 160,     # 每轮训练步数
+        games_per_iteration: int = 300,          # 每轮自对弈局数
+        train_steps_per_iteration: int = 960,     # 每轮训练步数
         baseline_eval_games: int = 100,           # 基准评估局数
         arena_games: int = 100,                   # 竞技场局数
         # ── MCTS 自对弈参数 ──
-        num_sims: int = 400,                     # MCTS 模拟次数
-        c_puct: float = 2.5,                     # PUCT 探索常数
+        num_sims: int = 300,                     # MCTS 模拟次数
+        c_puct: float = 1.5,                     # PUCT 探索常数
         dirichlet_alpha: float = 0.2,            # Dirichlet 噪声 alpha
         dirichlet_epsilon: float = 0.25,         # Dirichlet 噪声混合比例
         temp_threshold: int = 4,                 # 温度阈值（步数）
         candidate_radius: int = 2,               # 候选着法半径
         advantage_clip: float = 1.0,             # 优势裁剪范围
         # ── 竞技场参数 ──
-        arena_win_threshold: float = 0.6,        # 模型更新阈值
+        arena_win_threshold: float = 0.56,        # 模型更新阈值
         arena_collapse_threshold: float = 0.35,  # 坍塌检测阈值
         arena_save_image_every_n_games: int = 10, # 竞技场图片保存间隔
         # 核采样参数（竞技场无 MCTS，直接策略头核采样）
         arena_nucleus_p: float = 0.6,            # 核采样 top-p 累积概率阈值
         arena_nucleus_temp_threshold: int = 4,   # 开局高温步数阈值
-        arena_nucleus_early_temp: float = 1.5,   # 开局温度（>1 使分布更平坦，开局更丰富）
+        arena_nucleus_early_temp: float = 1,   # 开局温度（>1 使分布更平坦，开局更丰富）
         # 竞技场 MCTS 参数（已废弃，核采样化后不再使用）
         arena_c_puct: float = 2.5,               # [deprecated]
         arena_dirichlet_alpha: float = 0.2,      # [deprecated]
@@ -78,10 +78,10 @@ class AlphaZeroConfig:
         baseline_agent_max_candidates: int = 10, # 基准 Agent 候选数
         # 基准评估核采样参数（无 MCTS，直接策略头核采样）
         baseline_nucleus_p: float = 0.6,            # 基准评估核采样 top-p 阈值
-        baseline_nucleus_temp_threshold: int = 4,   # 基准评估开局高温步数阈值
+        baseline_nucleus_temp_threshold: int = 0,   # 基准评估开局高温步数阈值
         baseline_nucleus_early_temp: float = 1.5,   # 基准评估开局温度
         # ── 训练参数 ──
-        replay_buffer_size: int = 500000,        # 回放缓冲区容量
+        replay_buffer_size: int = 200000,        # 回放缓冲区容量
         min_replay_size: int = 5000,             # 最小训练样本数
         batch_size: int = 128,                   # 批次大小
         learning_rate: float = 1e-4,             # 学习率

@@ -3,9 +3,13 @@
 基于 **AlphaZero 强化学习**的五子棋训练系统。支持 **CNN v2 / v3 / Transformer** 多架构赛马，自对弈用 MCTS 搜索、竞技场评估用核采样快速裁定。
 
 ## 快速开始
+## Python版本 3.10.11
+
+## pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu118
 
 ```bash
-pip install torch numpy matplotlib tqdm
+pip install numpy matplotlib tqdm
+
 ```
 
 ### 人机对弈
