@@ -56,7 +56,7 @@ class AlphaZeroConfig:
         c_puct: float = 1.5,                     # PUCT 探索常数
         dirichlet_alpha: float = 0.2,            # Dirichlet 噪声 alpha
         dirichlet_epsilon: float = 0.25,         # Dirichlet 噪声混合比例
-        temp_threshold: int = 4,                 # 温度阈值（步数）
+        temp_threshold: int = 3,                 # 温度阈值（步数）
         candidate_radius: int = 2,               # 候选着法半径
         advantage_clip: float = 1.0,             # 优势裁剪范围
         # ── 竞技场参数 ──
@@ -65,7 +65,7 @@ class AlphaZeroConfig:
         arena_save_image_every_n_games: int = 10, # 竞技场图片保存间隔
         # 核采样参数（竞技场无 MCTS，直接策略头核采样）
         arena_nucleus_p: float = 0.6,            # 核采样 top-p 累积概率阈值
-        arena_nucleus_temp_threshold: int = 4,   # 开局高温步数阈值
+        arena_nucleus_temp_threshold: int = 3,   # 开局高温步数阈值
         arena_nucleus_early_temp: float = 1,   # 开局温度（>1 使分布更平坦，开局更丰富）
         # 竞技场 MCTS 参数（已废弃，核采样化后不再使用）
         arena_c_puct: float = 2.5,               # [deprecated]
