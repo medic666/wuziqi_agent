@@ -844,7 +844,7 @@ class AlphaZeroTrainer:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--arch', type=str, default=None,
-                        help='网络架构: cnn_v2 | cnn_v3 | transformer (默认读取配置)')
+                        help='网络架构: cnn_v2 | cnn_v3 | transformer | hybrid_v1 (默认读取配置)')
     parser.add_argument('--initial_model', type=str, default=None)
     parser.add_argument('--resume', action='store_true', default=False)
     args = parser.parse_args()

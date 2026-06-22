@@ -79,7 +79,7 @@ def main():
     parser.add_argument('--model_path', type=str, default=None,
                         help="模型路径 (自动推断架构)")
     parser.add_argument('--arch', type=str, default='cnn_v3',
-                        choices=['cnn_v2', 'cnn_v3', 'transformer'],
+                         choices=['cnn_v2', 'cnn_v3', 'transformer', 'hybrid_v1'],
                         help="无 checkpoint 时使用的随机权重架构 (默认: cnn_v3)")
     args = parser.parse_args()
 

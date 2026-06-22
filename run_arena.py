@@ -6,6 +6,7 @@
     python run_arena.py --agent1 rule_based --agent2 cnn_v2
     python run_arena.py --agent1 cnn_v2 --agent2 cnn_v3
     python run_arena.py --agent1 cnn_v3 --agent2 transformer
+    python run_arena.py --agent1 hybrid_v1 --agent2 cnn_v3
     python run_arena.py --agent1 rule_based --agent2 /path/to/custom_model.pt
 
 支持的 --agent1/--agent2 值:
@@ -13,6 +14,7 @@
     cnn_v2               → checkpoints/az_train/cnn_v2/best_model.pt
     cnn_v3               → checkpoints/az_train/cnn_v3/best_model.pt
     transformer          → checkpoints/az_train/transformer/best_model.pt
+    hybrid_v1            → checkpoints/az_train/hybrid_v1/best_model.pt
     /path/to/model.pt    → 显式模型路径 (AZAgent 自动推断架构)
 """
 
@@ -27,6 +29,7 @@ ARCH_TO_PATH = {
     'cnn_v2': 'checkpoints/az_train/cnn_v2/best_model.pt',
     'cnn_v3': 'checkpoints/az_train/cnn_v3/best_model.pt',
     'transformer': 'checkpoints/az_train/transformer/best_model.pt',
+    'hybrid_v1': 'checkpoints/az_train/hybrid_v1/best_model.pt',
 }
 
 
@@ -81,16 +84,17 @@ if __name__ == '__main__':
   python run_arena.py --agent1 rule_based --agent2 cnn_v2
   python run_arena.py --agent1 cnn_v2 --agent2 cnn_v3
   python run_arena.py --agent1 cnn_v3 --agent2 transformer
+  python run_arena.py --agent1 hybrid_v1 --agent2 cnn_v3
   python run_arena.py --agent1 rule_based --agent2 checkpoints/az_train/cnn_v3/best_model.pt
         """,
     )
     parser.add_argument(
         '--agent1', type=str, default='rule_based',
-        help="黑方 Agent: rule_based | cnn_v2 | cnn_v3 | transformer | /path/to/model.pt",
+        help="黑方 Agent: rule_based | cnn_v2 | cnn_v3 | transformer | hybrid_v1 | /path/to/model.pt",
     )
     parser.add_argument(
         '--agent2', type=str, default='cnn_v2',
-        help="白方 Agent: rule_based | cnn_v2 | cnn_v3 | transformer | /path/to/model.pt",
+        help="白方 Agent: rule_based | cnn_v2 | cnn_v3 | transformer | hybrid_v1 | /path/to/model.pt",
     )
     parser.add_argument(
         '--agent1-mode', type=str, default='mcts', choices=['mcts', 'nucleus'],

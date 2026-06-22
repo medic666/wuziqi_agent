@@ -5,19 +5,21 @@ agents.neural - 神经网络智能体子包
   - cnn_v2.py: CNN v9.2, 4×ResBlock(128) + GAP价值头, ~124万参数
   - cnn_v3.py: CNN v9.3, 5×ResBlock(64) + Cross-Attn价值头, ~41万参数
   - transformer.py: GoBangTransformer_v2, 5×Transformer, ~20万参数
+  - hybrid_v1.py: Hybrid v1, 5×ResBlock + 1×Transformer骨干, ~24万参数
+  - rope.py: 2D-RoPE 旋转位置编码 (共享模块)
   - registry.py: 架构注册表 (单一真理源)
   - az_agent.py: AZAgent 智能体，封装 MCTS + 神经网络推理（架构无关）
 
 架构对比:
-    ┌─────────────────┬──────────────┬──────────────┬──────────────────┐
-    │                 │ CNN v9.2     │ CNN v9.3     │ Transformer      │
-    ├─────────────────┼──────────────┼──────────────┼──────────────────┤
-    │ 特征提取        │ Pre-act ResNet│ Pre-act ResNet│ Pre-LN Transformer│
-    │ 位置信息        │ 隐式(卷积)   │ 隐式(卷积)   │ 显式 2D-RoPE     │
-    │ 价值头          │ Conv→GAP→FC  │ Cross-Attn+MLP│ Cross-Attn+MLP  │
-    │ 参数量          │ ~124万       │ ~41万        │ ~20万            │
-    │ 输入接口        │ (B,3,15,15)  │ (B,3,15,15)  │ (B,3,15,15)      │
-    └─────────────────┴──────────────┴──────────────┴──────────────────┘
+    ┌─────────────────┬──────────────┬──────────────┬──────────────────┬──────────────────┐
+    │                 │ CNN v9.2     │ CNN v9.3     │ Transformer      │ Hybrid v1        │
+    ├─────────────────┼──────────────┼──────────────┼──────────────────┼──────────────────┤
+    │ 特征提取        │ Pre-act ResNet│ Pre-act ResNet│ Pre-LN Transformer│ 5×CNN+1×Trans   │
+    │ 位置信息        │ 隐式(卷积)   │ 隐式(卷积)   │ 显式 2D-RoPE     │ 显式 2D-RoPE     │
+    │ 价值头          │ Conv→GAP→FC  │ Cross-Attn+MLP│ Cross-Attn+MLP  │ Cross-Attn+MLP  │
+    │ 参数量          │ ~124万       │ ~41万        │ ~20万            │ ~24万            │
+    │ 输入接口        │ (B,3,15,15)  │ (B,3,15,15)  │ (B,3,15,15)      │ (B,3,15,15)      │
+    └─────────────────┴──────────────┴──────────────┴──────────────────┴──────────────────┘
 
 使用:
    所有网络通过同一 AZAgent 智能体接入 MCTS/竞技场/训练流程，
@@ -27,14 +29,16 @@ agents.neural - 神经网络智能体子包
     python az_train.py --arch cnn_v2
     python az_train.py --arch cnn_v3
     python az_train.py --arch transformer
+    python az_train.py --arch hybrid_v1
 """
 
 # ── 网络模块 ──
 from agents.neural.cnn_v2 import ActorCriticNet_v2, ResBlock
 from agents.neural.cnn_v3 import ActorCriticNet_v3
+from agents.neural.hybrid_v1 import HybridNet_v1
+from agents.neural.rope import RoPE2D
 from agents.neural.transformer import (
     GoBangTransformer_v2,
-    RoPE2D,
     MultiHeadSelfAttention2D,
     TransformerBlock,
 )
@@ -64,6 +68,7 @@ __all__ = [
     'ActorCriticNet',           # 向后兼容别名 (→ v2)
     'ActorCriticNet_v2',
     'ActorCriticNet_v3',
+    'HybridNet_v1',
     'ResBlock',
     'GoBangTransformer_v2',
     'RoPE2D',

@@ -323,7 +323,7 @@ if __name__ == '__main__':
     # 必须将执行代码放在 if __name__ == '__main__': 保护下，否则会报错！
     parser = argparse.ArgumentParser(description="五子棋联合预训练")
     parser.add_argument('--arch', type=str, default='cnn_v3',
-                        choices=['cnn_v2', 'cnn_v3', 'transformer'],
+                         choices=['cnn_v2', 'cnn_v3', 'transformer', 'hybrid_v1'],
                         help='网络架构 (默认: cnn_v3)')
     parser.add_argument('--resume', action='store_true', default=False)
     parser.add_argument('--max_epochs', type=int, default=None)

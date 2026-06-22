@@ -28,6 +28,7 @@ ARCH_ALIASES: Dict[str, str] = {
     'cnn_v2':       'cnn_v2',
     'cnn_v3':       'cnn_v3',
     'transformer':  'transformer',
+    'hybrid_v1':    'hybrid_v1',
 }
 
 
@@ -99,6 +100,11 @@ def infer_arch_from_state_dict(state_dict: dict) -> str:
     if any_key == 'embed.weight' or any_key.startswith('blocks.'):
         return 'transformer'
 
+    # Hybrid v1: 通过主干 Transformer 独有键检测 (必须在 cnn_v3 之前)
+    hybrid_markers = ['trunk_qkv.weight', 'trunk_ln1.weight', 'trunk_ffn.0.weight']
+    if any(k in state_dict for k in hybrid_markers):
+        return 'hybrid_v1'
+
     # CNN: 通过 v3 独有键区分 v2 和 v3（最后防线）
     # v3 独有: cls_token, value_cross_attn.*, value_ln.*, value_mlp.*
     # v2 独有: value_conv1/2/3, value_bn1/2, value_fc1/2
@@ -153,7 +159,7 @@ def build_model_from_checkpoint(ckpt: dict, device=None):
             kwargs[k] = config[k]
 
     # 从权重推断（唯一实现点，杜绝各处 shape[0]/shape[1] 不一致 bug）
-    if arch_type in ('cnn_v2', 'cnn_v3'):
+    if arch_type in ('cnn_v2', 'cnn_v3', 'hybrid_v1'):
         kwargs['channels'] = state_dict['stem_conv.weight'].shape[0]
         res_idx = [int(k.split('.')[1]) for k in state_dict if k.startswith('res_blocks.')]
         kwargs['num_res_blocks'] = max(res_idx) + 1 if res_idx else kwargs['num_res_blocks']

@@ -23,7 +23,7 @@ class AlphaZeroConfig:
     """
     AlphaZero 自我对弈强化学习训练配置 (统一版)。
 
-    支持 CNN v9.2 / v9.3 / Transformer 三种架构，
+    支持 CNN v9.2 / v9.3 / Transformer / Hybrid v1 四种架构，
     通过 arch_type 参数切换。
 
     使用示例:
@@ -36,6 +36,9 @@ class AlphaZeroConfig:
         # Transformer
         config = AlphaZeroConfig(arch_type='transformer')
 
+        # CNN + Transformer 混合骨干
+        config = AlphaZeroConfig(arch_type='hybrid_v1')
+
         # 覆盖架构特定参数
         config = AlphaZeroConfig(arch_type='cnn_v3',
                                  arch_params={'channels': 128, 'num_res_blocks': 6})
@@ -43,7 +46,7 @@ class AlphaZeroConfig:
     def __init__(
         self,
         # ── ★ 架构选择 (统一入口) ──
-        arch_type: str = 'cnn_v3',               # 网络架构: 'cnn_v2' | 'cnn_v3' | 'transformer'
+        arch_type: str = 'cnn_v3',               # 网络架构: 'cnn_v2' | 'cnn_v3' | 'transformer' | 'hybrid_v1'
         arch_params: dict = None,                 # 架构参数覆盖 (None=使用注册表默认值)
         # ── 训练循环 ──
         num_iterations: int = 200,              # 总迭代次数
@@ -159,7 +162,7 @@ class PretrainConfig:
     支持多架构: 通过 arch_type + arch_params 指定
     """
     # ── 网络架构 ──
-    arch_type: str = 'cnn_v3'                   # 网络架构: 'cnn_v2' | 'cnn_v3' | 'transformer'
+    arch_type: str = 'cnn_v3'                   # 网络架构: 'cnn_v2' | 'cnn_v3' | 'transformer' | 'hybrid_v1'
     arch_params: dict = None                    # 架构参数覆盖 (None=使用注册表默认值)
     # 向后兼容字段 (由 arch_params 自动填充)
     num_res_blocks: int = 5                      # 默认 v9.3
@@ -256,7 +259,7 @@ class TrainConfig:
         val_ratio: float = 0.1,                  # 验证集比例
         max_samples: int = 0,                    # 最大样本数（0=全部）
         # ── 网络架构 ──
-        arch_type: str = 'cnn_v3',               # 网络架构: 'cnn_v2' | 'cnn_v3' | 'transformer'
+        arch_type: str = 'cnn_v3',               # 网络架构: 'cnn_v2' | 'cnn_v3' | 'transformer' | 'hybrid_v1'
         arch_params: dict = None,                 # 架构参数覆盖
         # 向后兼容字段 (由 arch_params 自动填充)
         num_res_blocks: int = 5,

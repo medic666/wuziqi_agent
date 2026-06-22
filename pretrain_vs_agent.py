@@ -265,6 +265,9 @@ class AgentPreTrainer:
         if self.config.arch_type == 'transformer':
             decay = [p for n, p in self.model.named_parameters() if not ('ln' in n or 'bias' in n or 'norm' in n)]
             no_decay = [p for n, p in self.model.named_parameters() if 'ln' in n or 'bias' in n or 'norm' in n]
+        elif self.config.arch_type == 'hybrid_v1':
+            decay = [p for n, p in self.model.named_parameters() if not ('bn' in n or 'ln' in n or 'bias' in n)]
+            no_decay = [p for n, p in self.model.named_parameters() if 'bn' in n or 'ln' in n or 'bias' in n]
         else:
             decay = [p for n, p in self.model.named_parameters() if not ('bn' in n or 'bias' in n)]
             no_decay = [p for n, p in self.model.named_parameters() if 'bn' in n or 'bias' in n]

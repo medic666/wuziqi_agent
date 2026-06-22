@@ -1,6 +1,6 @@
 # 五子棋 AI 训练系统 — AlphaZero + 核采样
 
-基于 **AlphaZero 强化学习**的五子棋训练系统。支持 **CNN v2 / v3 / Transformer** 多架构赛马，自对弈用 MCTS 搜索、竞技场评估用核采样快速裁定。
+基于 **AlphaZero 强化学习**的五子棋训练系统。支持 **CNN v2 / v3 / Transformer / hybrid_v1** 多架构赛马，自对弈用 MCTS 搜索、竞技场评估用核采样快速裁定。
 
 ## 快速开始
 
@@ -24,6 +24,9 @@ python human_vs_ai.py --mode nucleus --model checkpoints/az_train/cnn_v3/best_mo
 ```bash
 # CNN v3 vs CNN v2 (默认 MCTS)
 python run_arena.py --agent1 cnn_v3 --agent2 cnn_v2
+
+# hybrid_v1 vs CNN v3
+python run_arena.py --agent1 hybrid_v1 --agent2 cnn_v3
 
 # MCTS vs 核采样
 python run_arena.py --agent1 cnn_v3 --agent2 cnn_v3 \
@@ -79,7 +82,7 @@ Phase 1 自对弈 (MCTS)           Phase 2 网络训练              Phase 3 竞
 2. 模型加载统一走 `registry.build_model_from_checkpoint()` —— 自动推断架构、从权重解析参数、构造模型并加载
 3. Checkpoint 必须包含 `model_config.arch_type`，旧 `'cnn'` 别名自动映射为 `'cnn_v2'`
 
-添加新架构只需：创建文件 + `@register` + `__init__.py` import。
+添加新架构见下方「添加新架构」章节的完整检查清单。
 
 ### Checkpoint 格式
 
@@ -96,6 +99,8 @@ Phase 1 自对弈 (MCTS)           Phase 2 网络训练              Phase 3 竞
 ```
 
 所有 save 点统一调用 `model.get_config()`，消费者统一调用 `build_model_from_checkpoint()`。
+
+> `hybrid_v1` 的 `model_config` 包含 `{'arch_type': 'hybrid_v1', 'num_res_blocks': 5, 'channels': 64, 'board_size': 15}`。
 
 ---
 
@@ -117,7 +122,9 @@ wuziqi_agent/
 │       ├── registry.py      # 架构注册表 (单一真理源)
 │       ├── cnn_v2.py        # CNN v2 (4×ResBlock, 128ch)
 │       ├── cnn_v3.py        # CNN v3 (5×ResBlock, 64ch, Cross-Attn)
+│       ├── hybrid_v1.py     # Hybrid CNN+Transformer (5×ResBlock + 1×Transformer)
 │       ├── transformer.py   # Transformer (Pre-LN, 全局自注意力)
+│       ├── rope.py          # 2D-RoPE 旋转位置编码（共享模块）
 │       └── az_agent.py      # AZAgent (MCTS/核采样 双模式)
 │
 ├── training/
@@ -147,6 +154,7 @@ wuziqi_agent/
 | **CNN v2** `cnn_v2` | 4×ResBlock(128) | ~124万 | Conv→GAP→FC | 经典稳定 |
 | **CNN v3** `cnn_v3` | 5×ResBlock(64) | ~41万 | Cross-Attn+MLP | 轻量高效，注意力价值头 |
 | **Transformer** `transformer` | 5×Pre-LN | ~27万 | Cross-Attn+MLP | 全局视野，需预训练 |
+| **hybrid_v1** `hybrid_v1` | 5×ResBlock(64) + 1×Transformer | ~43万 | Cross-Attn+MLP | CNN+Transformer 混合，局部与全局兼顾 |
 
 接口统一：`(B, 3, 15, 15) → policy_logits(B, 225), value(B,)`。
 
@@ -158,7 +166,7 @@ wuziqi_agent/
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--arch` | `cnn_v3` | 架构: `cnn_v2` / `cnn_v3` / `transformer` |
+| `--arch` | `cnn_v3` | 架构: `cnn_v2` / `cnn_v3` / `transformer` / `hybrid_v1` |
 | `--initial_model` | (预训练权重) | 初始模型路径 |
 | `--resume` | `False` | 从 checkpoint 续训 |
 
@@ -332,7 +340,7 @@ config = AlphaZeroConfig(
 
 ## 添加新架构
 
-只需 **3 步**：
+除 `@register` + `__init__.py` import 外，还需完成以下检查清单：
 
 ### 1. 创建网络文件
 
@@ -359,7 +367,35 @@ class MyNet(nn.Module):
 
 在 `agents/neural/__init__.py` 添加：`from agents.neural.my_arch import MyNet`
 
-### 3. 训练
+### 3. `registry.py` — 3 处更新
+
+- `ARCH_ALIASES` 新增条目（如有别名）
+- `infer_arch_from_state_dict()` 新增独有键检测（必须在已有检测前插入）
+- `build_model_from_checkpoint()` 纳入权重推断分支
+
+### 4. `training/config.py` — 文档注释中 `arch_type` 说明新增架构名
+
+### 5. 各入口脚本更新
+
+| 脚本 | 更新内容 |
+|------|---------|
+| `az_train.py` | `--arch` help 文本新增 |
+| `pre_train.py` | `--arch` 的 `choices` 列表新增 |
+| `test.py` | `--arch` 的 `choices` 列表新增 |
+| `run_arena.py` | `ARCH_TO_PATH` 映射表 + 文档注释 + help 文本新增 |
+
+### 6. `pretrain_vs_agent.py` — weight decay 分组
+
+`_create_optimizer()` 中按架构分支排除参数：
+- **纯 CNN**（cnn_v2/v3）：排除 `bn` + `bias`
+- **纯 Transformer**：排除 `ln` + `bias` + `norm`
+- **混合架构**（hybrid_v1）：同时排除 `bn` + `ln` + `bias`
+
+### 7. 共享模块
+
+通用组件（如 RoPE2D）抽取到独立文件，避免循环依赖和多份拷贝。
+
+### 8. 训练
 
 ```bash
 python az_train.py --arch my_arch
@@ -381,10 +417,11 @@ python az_train.py --arch my_arch
 
 可以。系统根据 `model_config.arch_type` 自动推断，旧 `'cnn'` 映射为 `'cnn_v2'`。
 
-**Q: CNN v2/v3/Transformer 哪个更好？**
+**Q: CNN v2/v3/Transformer/hybrid_v1 哪个更好？**
 
 - **CNN v2** (124万): 最成熟，需更多数据
 - **CNN v3** (41万): 轻量高效，推荐首选
+- **hybrid_v1** (43万): CNN+Transformer 混合，兼具局部与全局，推荐作为 cnn_v3 的升级
 - **Transformer** (27万): 全局视野，建议先预训练
 
 建议用 `run_arena.py` 赛马对比。
